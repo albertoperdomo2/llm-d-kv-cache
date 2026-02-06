@@ -31,21 +31,31 @@ logger = logging.getLogger(__name__)
 
 _tokenizer_cache = {}
 _cache_locks = defaultdict(threading.Lock)
+_cache_locks_guard = threading.Lock()
+
+
+def _get_lock(key):
+    """Get or create a lock for the given cache key (thread-safe)."""
+    lock = _cache_locks.get(key)
+    if lock is not None:
+        return lock
+    with _cache_locks_guard:
+        return _cache_locks[key]
 
 
 def clear_caches():
     """Clear the tokenizer cache for testing purposes."""
-    # Sorted locks to avoid deadlock
-    keys_to_lock = sorted(_cache_locks.keys())
+    with _cache_locks_guard:
+        locks_to_acquire = [_cache_locks[k] for k in sorted(_cache_locks.keys())]
+
     acquired_locks = []
     try:
-        for key in keys_to_lock:
-            lock = _cache_locks[key]
+        for lock in locks_to_acquire:
             lock.acquire()
             acquired_locks.append(lock)
 
-            _tokenizer_cache.clear()
-            return "Tokenizer caches cleared"
+        _tokenizer_cache.clear()
+        return "Tokenizer caches cleared"
     finally:
         for lock in reversed(acquired_locks):
             lock.release()
@@ -90,7 +100,7 @@ def get_or_create_tokenizer_key(request_json):
         if tokenizer is not None:
             return key
 
-        lock = _cache_locks[key]
+        lock = _get_lock(key)
         with lock:
             tokenizer = _tokenizer_cache.get(key)
             if tokenizer is not None:
