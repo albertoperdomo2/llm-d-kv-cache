@@ -38,6 +38,8 @@ type IndexConfig struct {
 	ValkeyConfig *RedisIndexConfig `json:"valkeyConfig"`
 	// CostAwareMemoryConfig holds the configuration for the cost-aware memory index.
 	CostAwareMemoryConfig *CostAwareMemoryIndexConfig `json:"costAwareMemoryConfig"`
+	// CuckooStorageConfig holds the configuration for the CuckooStorageIndex.
+	CuckooStorageConfig *CuckooStorageIndexConfig `json:"cuckooStorageConfig"`
 
 	// EnableMetrics toggles whether admissions/evictions/hits/misses are
 	// recorded.
@@ -87,6 +89,11 @@ func NewIndex(ctx context.Context, cfg *IndexConfig) (Index, error) {
 		idx, err = NewInMemoryIndex(cfg.InMemoryConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create in-memory index: %w", err)
+		}
+	case cfg.CuckooStorageConfig != nil:
+		idx, err = NewCuckooStorageIndex(cfg.CuckooStorageConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Cuckoo storage index: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("no valid index configuration provided")
