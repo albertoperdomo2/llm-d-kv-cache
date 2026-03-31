@@ -34,6 +34,19 @@ func newTestPool(t *testing.T, blockSize int) (
 	return pool, idx, tp
 }
 
+// newTestPoolWithStorage creates a Pool with both GPU and storage indices.
+func newTestPoolWithStorage(t *testing.T, blockSize int, storageIndex kvblock.Index, accumulator *CheckpointAccumulator) (
+	*Pool, kvblock.Index, kvblock.TokenProcessor,
+) {
+	t.Helper()
+
+	pool, idx, tp := newTestPool(t, blockSize)
+	pool.storageIndex = storageIndex
+	pool.storageAccumulator = accumulator
+
+	return pool, idx, tp
+}
+
 // makeTokens creates a token slice [1, 2, ..., n].
 func makeTokens(n int) []uint32 {
 	tokens := make([]uint32, n)
@@ -503,4 +516,189 @@ func TestCanonicalWritePath_PartialBlockDrop(t *testing.T) {
 	result, err := idx.Lookup(ctx, []kvblock.BlockHash{kvblock.BlockHash(1)}, nil)
 	require.NoError(t, err)
 	assert.Empty(t, result[kvblock.BlockHash(1)])
+}
+
+// ---- Storage path tests ----
+
+func TestProcessEventBatch_GPUBlockStored_GoesToExistingIndex(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	pool, idx, _ := newTestPool(t, 16)
+
+	// 16 tokens = 1 full block at default blockSize=16
+	tokens := makeTokens(16)
+	engineKey := uint64(12345)
+
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: []uint64{engineKey},
+				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Derive the expected request key the same way the Pool does
+	expectedKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, expectedKeys, 1, "16 tokens at blockSize=16 should produce 1 key")
+
+	// Verify the key was added to the GPU/CPU index
+	podsPerKey, err := idx.Lookup(ctx, expectedKeys, nil)
+	require.NoError(t, err)
+	require.Contains(t, podsPerKey, expectedKeys[0])
+
+	pods := podsPerKey[expectedKeys[0]]
+	require.Len(t, pods, 1)
+	assert.Equal(t, "pod-1", pods[0].PodIdentifier)
+	assert.Equal(t, "gpu", pods[0].DeviceTier)
+
+	// Verify engine→request key mapping
+	resolvedKey, err := idx.GetRequestKey(ctx, kvblock.BlockHash(engineKey))
+	require.NoError(t, err)
+	assert.Equal(t, expectedKeys[0], resolvedKey)
+}
+
+func TestProcessEventBatch_StorageBlockStored_DoesNotWriteToGPUIndex(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	accumulator, err := NewCheckpointAccumulator(64, 1000)
+	require.NoError(t, err)
+
+	pool, idx, _ := newTestPoolWithStorage(t, 16, storageIndex, accumulator)
+
+	// 256 tokens = 16 canonical blocks at blockSize=16
+	tokens := makeTokens(256)
+	engineKey := uint64(99999)
+
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: []uint64{engineKey},
+				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Derive the canonical request keys
+	gpuKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, gpuKeys)
+
+	// Verify NONE of the keys were added to the GPU/CPU index
+	podsPerKey, err := idx.Lookup(ctx, gpuKeys, nil)
+	require.NoError(t, err)
+	assert.Empty(t, podsPerKey, "storage event should not write keys to GPU/CPU index")
+
+	// Verify the engine key is NOT in the GPU/CPU index
+	_, err = idx.GetRequestKey(ctx, kvblock.BlockHash(engineKey))
+	assert.Error(t, err, "engine key from storage event should not be in GPU/CPU index")
+}
+
+func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	// stride=2: checkpoint after every 2 canonical blocks
+	accumulator, err := NewCheckpointAccumulator(2, 1000)
+	require.NoError(t, err)
+
+	pool, _, _ := newTestPoolWithStorage(t, 16, storageIndex, accumulator)
+
+	// 32 tokens = 2 canonical blocks at blockSize=16, crosses stride=2 in one shot
+	tokens := makeTokens(32)
+	engineKeys := []uint64{11111, 22222}
+
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Derive the same canonical keys the Pool computed internally
+	canonicalKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, canonicalKeys, 2)
+
+	// count=2, stride=2 → checkpointPos = (2/2)*2 - 1 = 1
+	checkpointKey := canonicalKeys[1]
+
+	// Verify it's in the storage index
+	podsPerKey, err := pool.storageIndex.Lookup(ctx, []kvblock.BlockHash{checkpointKey}, nil)
+	require.NoError(t, err)
+	assert.Contains(t, podsPerKey, checkpointKey)
+
+	// Remove path: Block removed event
+	batch = &EventBatch{
+		Events: []GenericEvent{
+			&BlockRemovedEvent{
+				BlockHashes: []uint64{22222},
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Verify checkpoint was removed from the storage index
+	podsPerKey, err = pool.storageIndex.Lookup(ctx, []kvblock.BlockHash{checkpointKey}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, podsPerKey, "checkpoint should be gone after eviction")
+}
+
+func TestCheckpointAccumulator_TracksCountsAcrossEvents(t *testing.T) {
+	acc, err := NewCheckpointAccumulator(4, 1000) // stride=4
+	require.NoError(t, err)
+
+	prefix := kvblock.BlockHash(100) // simulates initial parentRequestKey
+
+	// Event 1: 1 block. Count: 0->1. No crossing.
+	count, crossed := acc.Accumulate(prefix, 1)
+	assert.Equal(t, 1, count)
+	assert.False(t, crossed)
+
+	// Update stores count under the LAST request key,
+	// which becomes the next event's parent.
+	lastKey1 := kvblock.BlockHash(200)
+	acc.Update(lastKey1, count)
+
+	// Event 2: 1 block, parent is lastKey1. Count: 1->2.
+	count, crossed = acc.Accumulate(lastKey1, 1)
+	assert.Equal(t, 2, count)
+	assert.False(t, crossed)
+
+	lastKey2 := kvblock.BlockHash(300)
+	acc.Update(lastKey2, count)
+
+	// Event 3: 1 block, parent is lastKey2. Count: 2->3.
+	count, crossed = acc.Accumulate(lastKey2, 1)
+	assert.Equal(t, 3, count)
+	assert.False(t, crossed)
+
+	lastKey3 := kvblock.BlockHash(400)
+	acc.Update(lastKey3, count)
+
+	// Event 4: 1 block, parent is lastKey3. Count: 3->4. Crosses stride=4!
+	count, crossed = acc.Accumulate(lastKey3, 1)
+	assert.Equal(t, 4, count)
+	assert.True(t, crossed, "should cross stride boundary at count=4")
 }

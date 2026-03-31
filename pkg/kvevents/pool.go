@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"k8s.io/client-go/util/workqueue"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
@@ -67,6 +68,35 @@ type PodDiscoveryConfig struct {
 	SocketPort int `json:"socketPort"`
 }
 
+// CheckpointAccumulator holds the data structure to track seen storage blocks per prefix.
+type CheckpointAccumulator struct {
+	counts *lru.Cache[kvblock.BlockHash, int]
+	stride int
+}
+
+// NewCheckpointAccumulator instantiates a new checkpointAccumulator with a given stride and capacity.
+func NewCheckpointAccumulator(stride, capacity int) (*CheckpointAccumulator, error) {
+	counts, err := lru.New[kvblock.BlockHash, int](capacity)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CheckpointAccumulator{counts: counts, stride: stride}, nil
+}
+
+// Accumulate adds blocks and returns (newCount, crossedBoundary).
+func (a *CheckpointAccumulator) Accumulate(parentKey kvblock.BlockHash, numBlocks int) (int, bool) {
+	current, _ := a.counts.Get(parentKey)
+	newCount := current + numBlocks
+	crossed := (current / a.stride) != (newCount / a.stride) // XXX: Simplify
+	return newCount, crossed
+}
+
+// Update stores the new count keyed by the latest request key.
+func (a *CheckpointAccumulator) Update(key kvblock.BlockHash, count int) {
+	a.counts.Add(key, count)
+}
+
 // DefaultPodReconcilerConfig returns a default configuration for the pod reconciler.
 func DefaultPodReconcilerConfig() *PodDiscoveryConfig {
 	return &PodDiscoveryConfig{
@@ -89,12 +119,14 @@ func DefaultConfig() *Config {
 // It ensures that events for the same PodIdentifier are processed in order.
 // Pool is stateless — all key mappings are delegated to the Index.
 type Pool struct {
-	queues         []workqueue.TypedRateLimitingInterface[*RawMessage]
-	concurrency    int // can replace use with len(queues)
-	index          kvblock.Index
-	tokenProcessor kvblock.TokenProcessor
-	adapter        EngineAdapter
-	wg             sync.WaitGroup
+	queues             []workqueue.TypedRateLimitingInterface[*RawMessage]
+	concurrency        int // can replace use with len(queues)
+	index              kvblock.Index
+	tokenProcessor     kvblock.TokenProcessor
+	adapter            EngineAdapter
+	wg                 sync.WaitGroup
+	storageIndex       kvblock.Index
+	storageAccumulator *CheckpointAccumulator
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -284,7 +316,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			parentRequestKey := kvblock.EmptyBlockHash
 			if ev.ParentHash != 0 {
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
+				// Try GPU/CPU index first, then storage index
 				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
+				if err != nil && p.storageIndex != nil {
+					key, err = p.storageIndex.GetRequestKey(ctx, parentEngineKey)
+				}
 				if err != nil {
 					debugLogger.Error(err, "Failed to get request key for parent block",
 						"parentEngineKey", parentEngineKey, "effectiveModelName", effectiveModelName)
@@ -293,74 +329,109 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				parentRequestKey = key
 			}
 
-			var extraFeatures []*kvblock.BlockExtraFeatures
-			if ev.ExtraKeys != nil {
-				var err error
-				extraFeatures, err = kvblock.ParseRawExtraKeys(ev.ExtraKeys)
+			if isStorageTier(deviceTier) && p.storageIndex != nil {
+				// Storage path: checkpoint accumulation using canonical block keys.
+				// Storage events are text-only, no extraFeatures.
+				requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
+					parentRequestKey, ev.Tokens, effectiveModelName, nil)
 				if err != nil {
-					debugLogger.Error(err, "Failed to parse extra keys",
-						"podIdentifier", podIdentifier)
+					debugLogger.Error(err, "Failed to generate request keys for storage event",
+						"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
 					continue
 				}
-			}
 
-			// Realign extraFeatures from engine-block granularity to canonical-block
-			// granularity. ParseRawExtraKeys returns one entry per engine block, but
-			// TokensToKVBlockKeys expects one entry per canonical block.
-			if extraFeatures != nil {
-				canonicalBlockCount := len(ev.Tokens) / p.tokenProcessor.BlockSize()
-				if len(extraFeatures) != canonicalBlockCount {
-					extraFeatures = realignExtraFeatures(extraFeatures, canonicalBlockCount)
-				}
-			}
+				if len(requestKeys) > 0 {
+					lastKey := requestKeys[len(requestKeys)-1]
+					count, crossed := p.storageAccumulator.Accumulate(parentRequestKey, len(requestKeys))
+					p.storageAccumulator.Update(lastKey, count)
 
-			traceLogger := log.FromContext(ctx).V(logging.TRACE)
-			if traceLogger.Enabled() {
-				nonNil := 0
-				for _, ef := range extraFeatures {
-					if ef != nil {
-						nonNil++
+					if crossed {
+						// Insert checkpoint keys at stride boundary via Index.Add
+						checkpointPos := (count/p.storageAccumulator.stride)*p.storageAccumulator.stride - 1
+						if checkpointPos >= 0 && checkpointPos < len(requestKeys) {
+							storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+							cpEngineKeys := []kvblock.BlockHash{engineKeys[checkpointPos]}
+							cpRequestKeys := []kvblock.BlockHash{requestKeys[checkpointPos]}
+							if err := p.storageIndex.Add(ctx, cpEngineKeys, cpRequestKeys, storageEntries); err != nil {
+								debugLogger.Error(err, "Failed to add storage checkpoint to index",
+									"podIdentifier", podIdentifier,
+									"engineKey", engineKeys[checkpointPos],
+									"requestKey", requestKeys[checkpointPos])
+							}
+						}
 					}
 				}
-				traceLogger.Info("BlockStored extra_features",
-					"podIdentifier", podIdentifier,
-					"hasExtraKeys", ev.ExtraKeys != nil,
-					"parsedBlockCount", len(extraFeatures),
-					"nonNilBlocks", nonNil,
-					"numTokens", len(ev.Tokens),
-					"numEngineKeys", len(ev.BlockHashes))
-				for bIdx, ef := range extraFeatures {
-					if ef != nil {
-						traceLogger.Info("BlockStored block extra",
-							"podIdentifier", podIdentifier,
-							"blockIdx", bIdx,
-							"mmHashes", fmt.Sprintf("%+v", ef.MMHashes))
+			} else {
+				// Existing GPU/CPU path
+				var extraFeatures []*kvblock.BlockExtraFeatures
+				if ev.ExtraKeys != nil {
+					var err error
+					extraFeatures, err = kvblock.ParseRawExtraKeys(ev.ExtraKeys)
+					if err != nil {
+						debugLogger.Error(err, "Failed to parse extra keys",
+							"podIdentifier", podIdentifier)
+						continue
 					}
 				}
-			}
 
-			// Compute request keys at canonical block size (= BlockSize)
-			requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
-				parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures)
-			if err != nil {
-				debugLogger.Error(err, "Failed to generate request keys",
-					"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
-				continue
-			}
+				// Realign extraFeatures from engine-block granularity to canonical-block
+				// granularity. ParseRawExtraKeys returns one entry per engine block, but
+				// TokensToKVBlockKeys expects one entry per canonical block.
+				if extraFeatures != nil {
+					canonicalBlockCount := len(ev.Tokens) / p.tokenProcessor.BlockSize()
+					if len(extraFeatures) != canonicalBlockCount {
+						extraFeatures = realignExtraFeatures(extraFeatures, canonicalBlockCount)
+					}
+				}
 
-			if len(requestKeys) == 0 {
-				debugLogger.Info("no request keys produced, skipping",
-					"podIdentifier", podIdentifier, "tokenCount", len(ev.Tokens),
-					"blockSize", p.tokenProcessor.BlockSize())
-				continue
-			}
+				traceLogger := log.FromContext(ctx).V(logging.TRACE)
+				if traceLogger.Enabled() {
+					nonNil := 0
+					for _, ef := range extraFeatures {
+						if ef != nil {
+							nonNil++
+						}
+					}
+					traceLogger.Info("BlockStored extra_features",
+						"podIdentifier", podIdentifier,
+						"hasExtraKeys", ev.ExtraKeys != nil,
+						"parsedBlockCount", len(extraFeatures),
+						"nonNilBlocks", nonNil,
+						"numTokens", len(ev.Tokens),
+						"numEngineKeys", len(ev.BlockHashes))
+					for bIdx, ef := range extraFeatures {
+						if ef != nil {
+							traceLogger.Info("BlockStored block extra",
+								"podIdentifier", podIdentifier,
+								"blockIdx", bIdx,
+								"mmHashes", fmt.Sprintf("%+v", ef.MMHashes))
+						}
+					}
+				}
 
-			// Index.Add infers the engine->request mapping from the ratio of
-			// len(engineKeys) to len(requestKeys) (1:1, many:1, or 1:many).
-			if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
-				debugLogger.Error(err, "Failed to add event to index",
-					"podIdentifier", podIdentifier, "event", ev)
-				continue
+				// Compute request keys at canonical block size (= BlockSize)
+				requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
+					parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures)
+				if err != nil {
+					debugLogger.Error(err, "Failed to generate request keys",
+						"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
+					continue
+				}
+
+				if len(requestKeys) == 0 {
+					debugLogger.Info("no request keys produced, skipping",
+						"podIdentifier", podIdentifier, "tokenCount", len(ev.Tokens),
+						"blockSize", p.tokenProcessor.BlockSize())
+					continue
+				}
+
+				// Index.Add infers the engine->request mapping from the ratio of
+				// len(engineKeys) to len(requestKeys) (1:1, many:1, or 1:many).
+				if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
+					debugLogger.Error(err, "Failed to add event to index",
+						"podIdentifier", podIdentifier, "event", ev)
+					continue
+				}
 			}
 
 		case *BlockRemovedEvent:
@@ -370,18 +441,27 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				deviceTier = strings.ToLower(ev.DeviceTier)
 			}
 
-			// Create PodEntry for this specific event's device tier
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			if isStorageTier(deviceTier) && p.storageIndex != nil {
+				storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+				for _, hash := range ev.BlockHashes {
+					engineKey := kvblock.BlockHash(hash)
+					p.storageIndex.Evict(ctx, engineKey, kvblock.EngineKey, storageEntries)
+				}
+			} else {
 
-			// Iterate over the hashes and evict each key.
-			// The Index handles engine->request key resolution internally for both
-			// 1:1 (legacy) and 1:many (canonical) mappings.
-			for _, hash := range ev.BlockHashes {
-				engineKey := kvblock.BlockHash(hash)
-				if err := p.index.Evict(ctx, engineKey, kvblock.EngineKey, podEntries); err != nil {
-					debugLogger.Error(err, "Failed to evict engine key from index",
-						"podIdentifier", podIdentifier, "engineKey", engineKey)
-					continue
+				// Create PodEntry for this specific event's device tier
+				podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+
+				// Iterate over the hashes and evict each key.
+				// The Index handles engine->request key resolution internally for both
+				// 1:1 (legacy) and 1:many (canonical) mappings.
+				for _, hash := range ev.BlockHashes {
+					engineKey := kvblock.BlockHash(hash)
+					if err := p.index.Evict(ctx, engineKey, kvblock.EngineKey, podEntries); err != nil {
+						debugLogger.Error(err, "Failed to evict engine key from index",
+							"podIdentifier", podIdentifier, "engineKey", engineKey)
+						continue
+					}
 				}
 			}
 
@@ -395,4 +475,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
 	}
+}
+
+func isStorageTier(tier string) bool {
+	return tier == "shared_storage" || tier == "local_storage"
 }
