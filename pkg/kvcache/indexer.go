@@ -59,6 +59,18 @@ func NewDefaultConfig() (*Config, error) {
 	}, nil
 }
 
+// StorageConfig holds configuration for the storage checkpoint scoring path.
+type StorageConfig struct {
+	// StorageBlockSize is the number of tokens per storage block (e.g., 256).
+	StorageBlockSize int `json:"storageBlockSize"`
+	// CheckpointStride is the number of storage blocks between checkpoint samples.
+	CheckpointStride int `json:"checkpointStride"`
+	// StorageWeight is the scoring weight for storage coverage beyond the GPU prefix.
+	StorageWeight float64 `json:"storageWeight"`
+	// MinPrefixBlocks is the minimum number of storage blocks for the storage bonus to apply.
+	MinPrefixBlocks int `json:"minPrefixBlocks"`
+}
+
 // Indexer is a concrete implementation of the KVCacheIndex interface.
 type Indexer struct {
 	config *Config
@@ -68,6 +80,9 @@ type Indexer struct {
 	kvBlockScorer  KVBlockScorer          // scores pods based on block hits
 
 	tokenizersPool TokenizersPool
+
+	storageIndex  kvblock.Index
+	storageConfig *StorageConfig // stride, block size, weight, min prefix
 }
 
 // NewKVCacheIndexer creates a KVCacheIndex given a Config.
@@ -266,6 +281,52 @@ func (k *Indexer) ScoreTokens(
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to query kvblock scorer: %w", err)
+	}
+
+	if k.storageIndex != nil && k.storageConfig != nil {
+		// Sample checkpoint keys at stride intervals from the canonical block chain.
+		// Checkpoints are positions along the same hash chain used for GPU/CPU indexing.
+		stride := k.storageConfig.CheckpointStride
+		var checkpointKeys []kvblock.BlockHash
+		for i := stride - 1; i < len(blockKeys); i += stride {
+			checkpointKeys = append(checkpointKeys, blockKeys[i])
+		}
+
+		if len(checkpointKeys) > 0 {
+			// Look up checkpoint keys in the storage index
+			storageLookup, err := k.storageIndex.Lookup(ctx, checkpointKeys, nil)
+			highestCheckpoint := -1
+			if err != nil {
+				traceLogger.Error(err, "storage index lookup failed, skipping storage scoring")
+			} else {
+				// Walk checkpoints sequentially, stop at first miss
+				for i, key := range checkpointKeys {
+					if _, found := storageLookup[key]; found {
+						highestCheckpoint = i
+					} else {
+						break
+					}
+				}
+			}
+
+			// Convert: checkpointIndex -> canonical blocks covered
+			storagePrefixBlocks := (highestCheckpoint + 1) * stride
+			if highestCheckpoint >= 0 && storagePrefixBlocks >= k.storageConfig.MinPrefixBlocks {
+				// For the current shared-storage MVP, storage is bonus-only:
+				// it extends existing pod scores and does not create new candidates.
+				for pod, gpuScore := range podScores {
+					gpuPrefixLen := int(gpuScore)
+					if storagePrefixBlocks > gpuPrefixLen {
+						podScores[pod] = gpuScore + float64(storagePrefixBlocks-gpuPrefixLen)*k.storageConfig.StorageWeight
+					}
+				}
+
+				span.SetAttributes(
+					attribute.Int("llm_d.kv_cache.storage_checkpoint_highest", highestCheckpoint),
+					attribute.Int("llm_d.kv_cache.storage_prefix_blocks", storagePrefixBlocks),
+				)
+			}
+		}
 	}
 
 	return podScores, nil

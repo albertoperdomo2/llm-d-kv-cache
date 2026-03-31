@@ -30,3 +30,20 @@ func NewIndexerForTest(tp kvblock.TokenProcessor, idx kvblock.Index, scorer KVBl
 		tokenizersPool: pool,
 	}
 }
+
+// NewIndexerForTestWithStorage is like NewIndexerForTest but also wires
+// a storage index and its config for testing the storage scoring path.
+func NewIndexerForTestWithStorage(
+	tp kvblock.TokenProcessor, idx kvblock.Index, scorer KVBlockScorer, pool TokenizersPool,
+	storageIdx kvblock.Index, storageCfg *StorageConfig,
+) *Indexer {
+	return &Indexer{
+		config:         &Config{},
+		tokenProcessor: tp,
+		kvBlockIndex:   idx,
+		kvBlockScorer:  scorer,
+		tokenizersPool: pool,
+		storageIndex:   storageIdx,
+		storageConfig:  storageCfg,
+	}
+}

@@ -285,6 +285,268 @@ func TestScoreTokens(t *testing.T) {
 	}
 }
 
+// --- ScoreTokens storage tests -----------------------------------------------
+// These cover the storage checkpoint scoring path added by Phase 4.
+
+// newTestIndexerWithStorage creates an Indexer backed by an in-memory GPU index,
+// a real CuckooStorageIndex, and the provided storage config.
+func newTestIndexerWithStorage(t *testing.T, tp kvblock.TokenProcessor, storageCfg *kvcache.StorageConfig) (*kvcache.Indexer, *kvblock.CuckooStorageIndex) {
+	t.Helper()
+
+	gpuIndex, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+
+	scorer, err := kvcache.NewKVBlockScorer(kvcache.DefaultKVBlockScorerConfig())
+	require.NoError(t, err)
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	indexer := kvcache.NewIndexerForTestWithStorage(tp, gpuIndex, scorer, &mockTokenizersPool{}, storageIndex, storageCfg)
+	return indexer, storageIndex
+}
+
+func TestScoreTokens_StorageBonusApplied(t *testing.T) {
+	// Checkpoints are sampled from canonical blockKeys at stride intervals.
+	//
+	// Setup:
+	//   blockKeys: [10, 20, 30, 40, 50, 60] — stride=2, checkpoints at indices 1,3,5
+	//   checkpoint keys: [20, 40, 60]
+	//   GPU index: pod-a has blocks 10 and 20 (GPU score = 2.0)
+	//   Storage index: has checkpoint key 20 (index 0), misses 40 (index 1) → walk stops
+	//
+	// Expected:
+	//   highestCheckpoint = 0
+	//   storagePrefixBlocks = (0+1) * 2 = 2
+	//   2 > 2? No → no bonus. GPU score = 2.0
+	//
+	// To get a bonus, we need storagePrefixBlocks > gpuPrefixLen.
+	// Use stride=1 so every block is a checkpoint.
+	//   blockKeys: [10, 20, 30, 40] — stride=1, checkpoints at 0,1,2,3 → keys [10,20,30,40]
+	//   Storage has all 4 checkpoints → highestCheckpoint=3
+	//   storagePrefixBlocks = (3+1)*1 = 4
+	//   GPU: pod-a has blocks 10,20 (score=2.0)
+	//   4 > 2 → bonus = (4-2)*0.3 = 0.6
+	//   final = 2.0 + 0.6 = 2.6
+
+	tp := &mockTokenProcessor{
+		blockKeys: u64ToBlockKeys([]uint64{10, 20, 30, 40}),
+	}
+
+	storageCfg := &kvcache.StorageConfig{
+		CheckpointStride: 1,
+		StorageWeight:    0.3,
+		MinPrefixBlocks:  1,
+	}
+
+	indexer, storageIndex := newTestIndexerWithStorage(t, tp, storageCfg)
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	// GPU: pod-a has blocks 10 and 20 (prefix of length 2)
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+		20: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+	})
+
+	// Storage: all 4 canonical keys present as checkpoints
+	storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+	err := storageIndex.Add(ctx, nil,
+		u64ToBlockKeys([]uint64{10, 20, 30, 40}),
+		storageEntries)
+	require.NoError(t, err)
+
+	scores, err := indexer.ScoreTokens(ctx, []uint32{1, 2, 3, 4}, testModel, nil, nil)
+	require.NoError(t, err)
+	require.Contains(t, scores, testPodA)
+	assert.InDelta(t, 2.6, scores[testPodA], 0.0001,
+		"GPU score (2.0) + storage bonus ((4-2)*0.3 = 0.6) = 2.6")
+}
+
+func TestScoreTokens_StorageWithinGPUPrefix_NoBonus(t *testing.T) {
+	// GPU covers more than storage → no bonus applied.
+	//
+	// blockKeys: [10, 20, 30] — stride=1, checkpoints at 0,1,2 → keys [10,20,30]
+	// GPU: pod-a has all 3 blocks (GPU score = 3.0)
+	// Storage: only checkpoint key 10 → highestCheckpoint=0
+	// storagePrefixBlocks = (0+1)*1 = 1. 1 < 3 → no bonus.
+
+	tp := &mockTokenProcessor{
+		blockKeys: u64ToBlockKeys([]uint64{10, 20, 30}),
+	}
+
+	storageCfg := &kvcache.StorageConfig{
+		CheckpointStride: 1,
+		StorageWeight:    0.3,
+		MinPrefixBlocks:  1,
+	}
+
+	indexer, storageIndex := newTestIndexerWithStorage(t, tp, storageCfg)
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+		20: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+		30: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+	})
+
+	storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+	err := storageIndex.Add(ctx, nil, []kvblock.BlockHash{kvblock.BlockHash(10)}, storageEntries)
+	require.NoError(t, err)
+
+	scores, err := indexer.ScoreTokens(ctx, []uint32{1, 2, 3}, testModel, nil, nil)
+	require.NoError(t, err)
+	require.Contains(t, scores, testPodA)
+	assert.InDelta(t, 3.0, scores[testPodA], 0.0001,
+		"storage covers less than GPU prefix — no bonus applied")
+}
+
+func TestScoreTokens_StorageBelowMinPrefixBlocks_NoBonus(t *testing.T) {
+	// Storage coverage exists but is below MinPrefixBlocks threshold.
+	//
+	// blockKeys: [10, 20, 30, 40] — stride=2, checkpoints at indices 1,3 → keys [20,40]
+	// Storage has key 20 → highestCheckpoint=0
+	// storagePrefixBlocks = (0+1)*2 = 2. MinPrefixBlocks=100 → 2 < 100 → no bonus.
+
+	tp := &mockTokenProcessor{
+		blockKeys: u64ToBlockKeys([]uint64{10, 20, 30, 40}),
+	}
+
+	storageCfg := &kvcache.StorageConfig{
+		CheckpointStride: 2,
+		StorageWeight:    0.3,
+		MinPrefixBlocks:  100, // threshold much higher than coverage
+	}
+
+	indexer, storageIndex := newTestIndexerWithStorage(t, tp, storageCfg)
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+	})
+
+	storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+	err := storageIndex.Add(ctx, nil, []kvblock.BlockHash{kvblock.BlockHash(20)}, storageEntries)
+	require.NoError(t, err)
+
+	scores, err := indexer.ScoreTokens(ctx, []uint32{1, 2, 3, 4}, testModel, nil, nil)
+	require.NoError(t, err)
+	require.Contains(t, scores, testPodA)
+	assert.InDelta(t, 1.0, scores[testPodA], 0.0001,
+		"storage below MinPrefixBlocks — no bonus applied")
+}
+
+func TestScoreTokens_DifferentialBonusAcrossPods(t *testing.T) {
+	// Two pods with different GPU prefix lengths get different storage bonuses.
+	//
+	// blockKeys: [10, 20, 30, 40, 50, 60] — stride=2, checkpoints at 1,3,5 → keys [20,40,60]
+	// GPU: pod-a has 10,20,30 (score=3.0), pod-b has 10 (score=1.0)
+	// Storage: all 3 checkpoints present → highestCheckpoint=2
+	// storagePrefixBlocks = (2+1)*2 = 6
+	//
+	// pod-a: 6 > 3 → bonus = (6-3)*0.3 = 0.9, final = 3.9
+	// pod-b: 6 > 1 → bonus = (6-1)*0.3 = 1.5, final = 2.5
+
+	tp := &mockTokenProcessor{
+		blockKeys: u64ToBlockKeys([]uint64{10, 20, 30, 40, 50, 60}),
+	}
+
+	storageCfg := &kvcache.StorageConfig{
+		CheckpointStride: 2,
+		StorageWeight:    0.3,
+		MinPrefixBlocks:  1,
+	}
+
+	indexer, storageIndex := newTestIndexerWithStorage(t, tp, storageCfg)
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {
+			{PodIdentifier: testPodA, DeviceTier: "gpu"},
+			{PodIdentifier: testPodB, DeviceTier: "gpu"},
+		},
+		20: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+		30: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+	})
+
+	storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+	err := storageIndex.Add(ctx, nil,
+		u64ToBlockKeys([]uint64{20, 40, 60}),
+		storageEntries)
+	require.NoError(t, err)
+
+	scores, err := indexer.ScoreTokens(ctx, []uint32{1, 2, 3, 4, 5, 6}, testModel, nil, nil)
+	require.NoError(t, err)
+
+	require.Contains(t, scores, testPodA)
+	require.Contains(t, scores, testPodB)
+	assert.InDelta(t, 3.9, scores[testPodA], 0.0001,
+		"pod-a: GPU(3.0) + storage((6-3)*0.3=0.9) = 3.9")
+	assert.InDelta(t, 2.5, scores[testPodB], 0.0001,
+		"pod-b: GPU(1.0) + storage((6-1)*0.3=1.5) = 2.5")
+}
+
+func TestScoreTokens_NoStorageIndex_Unchanged(t *testing.T) {
+	// Verify that nil storageIndex produces identical results to the base scoring path.
+	tp := &mockTokenProcessor{
+		blockKeys: u64ToBlockKeys([]uint64{10, 20, 30}),
+	}
+
+	indexer := newTestIndexer(t, tp, &mockTokenizersPool{})
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+		20: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+	})
+
+	scores, err := indexer.ScoreTokens(ctx, []uint32{1, 2, 3}, testModel, nil, nil)
+	require.NoError(t, err)
+	require.Contains(t, scores, testPodA)
+	assert.InDelta(t, 2.0, scores[testPodA], 0.0001,
+		"no storage index — GPU-only score unchanged")
+}
+
+func TestScoreTokens_StorageCheckpointGap_StopsAtMiss(t *testing.T) {
+	// Walk stops at the first missing checkpoint — later hits are ignored.
+	//
+	// blockKeys: [10, 20, 30, 40, 50, 60] — stride=2, checkpoints at 1,3,5 → keys [20,40,60]
+	// Storage has keys 20 and 60 but NOT 40 (gap at checkpoint index 1)
+	// Walk: 20 hit, 40 miss → stop. highestCheckpoint = 0
+	// storagePrefixBlocks = (0+1)*2 = 2
+	// GPU: pod-a has block 10 (score=1.0)
+	// 2 > 1 → bonus = (2-1)*0.3 = 0.3, final = 1.3
+
+	tp := &mockTokenProcessor{
+		blockKeys: u64ToBlockKeys([]uint64{10, 20, 30, 40, 50, 60}),
+	}
+
+	storageCfg := &kvcache.StorageConfig{
+		CheckpointStride: 2,
+		StorageWeight:    0.3,
+		MinPrefixBlocks:  1,
+	}
+
+	indexer, storageIndex := newTestIndexerWithStorage(t, tp, storageCfg)
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
+	})
+
+	// Insert checkpoints 0 and 2, but NOT checkpoint 1 (gap)
+	storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+	err := storageIndex.Add(ctx, nil,
+		[]kvblock.BlockHash{kvblock.BlockHash(20), kvblock.BlockHash(60)},
+		storageEntries)
+	require.NoError(t, err)
+
+	scores, err := indexer.ScoreTokens(ctx, []uint32{1, 2, 3, 4, 5, 6}, testModel, nil, nil)
+	require.NoError(t, err)
+	require.Contains(t, scores, testPodA)
+	assert.InDelta(t, 1.3, scores[testPodA], 0.0001,
+		"walk stops at gap: GPU(1.0) + storage((2-1)*0.3=0.3) = 1.3")
+}
+
 // --- GetPodScores-specific tests --------------------------------------------
 // These cover behavior unique to GetPodScores that ScoreTokens
 // does not have (i.e. prompt truncation).
