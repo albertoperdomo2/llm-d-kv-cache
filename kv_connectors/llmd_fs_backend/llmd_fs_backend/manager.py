@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
+    OffloadingEvent,
     OffloadingManager,
     PrepareStoreOutput,
 )
@@ -34,8 +35,16 @@ class SharedStorageOffloadingManager(OffloadingManager):
     SharedStorageOffloadingManager manages KV offloading to a shared storage medium.
     """
 
-    def __init__(self, file_mapper: FileMapper) -> None:
+    def __init__(
+        self,
+        file_mapper: FileMapper,
+        block_size: int = 256,
+        enable_events: bool = False,
+    ) -> None:
         self.file_mapper: FileMapper = file_mapper
+        self.block_size: int = block_size
+        self.events: list[OffloadingEvent] | None = [] if enable_events else None
+        self.medium: str = SharedStorageLoadStoreSpec.medium()
 
     # ----------------------------------------------------------------------
     # Lookup
@@ -98,5 +107,21 @@ class SharedStorageOffloadingManager(OffloadingManager):
     def complete_store(self, block_hashes: Iterable[BlockHash], success: bool = True):
         """
         For shared storage, storing is stateless - no action needed.
+        XXX: Events are needed
         """
-        pass
+        if success and self.events is not None:
+            block_hashes_list = list(block_hashes)
+            if block_hashes_list:
+                self.events.append(
+                    OffloadingEvent(
+                        block_hashes=block_hashes_list,
+                        block_size=self.block_size,
+                        medium=self.medium,
+                        removed=False,
+                    )
+                )
+
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        if self.events is not None:
+            yield from self.events
+            self.events.clear()
