@@ -102,8 +102,16 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         assert self.vllm_config.parallel_config.rank == 0, "Scheduler rank should be 0"
+        kv_events_config = self.vllm_config.kv_events_config
+        enable_events = (
+            kv_events_config is not None and kv_events_config.enable_kv_cache_events
+        )
         if not self._manager:
-            self._manager = SharedStorageOffloadingManager(file_mapper=self.file_mapper)
+            self._manager = SharedStorageOffloadingManager(
+                file_mapper=self.file_mapper,
+                block_size=self.offloaded_block_size,
+                enable_events=enable_events,
+            )
         return self._manager
 
     def get_handlers(
