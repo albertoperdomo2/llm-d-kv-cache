@@ -24,6 +24,8 @@ import pytest
 import storage_offload
 import torch
 
+pytestmark = pytest.mark.requires_cuda
+
 
 def _collect_gds_status() -> dict:
     """Collect GDS availability indicators and return as a dict."""

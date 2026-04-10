@@ -76,3 +76,8 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
+
+[tool.pytest.ini_options]
+markers = [
+    "requires_cuda: marks tests that require CUDA and vLLM",
+]

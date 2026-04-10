@@ -35,6 +35,8 @@ from llmd_fs_backend.file_mapper import FileMapper
 from llmd_fs_backend.mediums import SharedStorageLoadStoreSpec
 from llmd_fs_backend.worker import StorageOffloadingHandlers
 
+pytestmark = pytest.mark.requires_cuda
+
 TMP_DIR = "/tmp/shared-kv-test"
 
 # ----------------------------

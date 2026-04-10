@@ -106,8 +106,8 @@ class SharedStorageOffloadingManager(OffloadingManager):
 
     def complete_store(self, block_hashes: Iterable[BlockHash], success: bool = True):
         """
-        For shared storage, storing is stateless - no action needed.
-        XXX: Events are needed
+        For shared storage, storing is stateless.
+        On success, emits an OffloadingEvent so the indexer is notified.
         """
         if success and self.events is not None:
             block_hashes_list = list(block_hashes)
