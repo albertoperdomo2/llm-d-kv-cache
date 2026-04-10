@@ -21,8 +21,8 @@ import (
 	"strings"
 	"sync"
 
-	"k8s.io/client-go/util/workqueue"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
@@ -76,6 +76,13 @@ type CheckpointAccumulator struct {
 
 // NewCheckpointAccumulator instantiates a new checkpointAccumulator with a given stride and capacity.
 func NewCheckpointAccumulator(stride, capacity int) (*CheckpointAccumulator, error) {
+	if stride <= 0 {
+		return nil, fmt.Errorf("stride must be greater than 0")
+	}
+	if capacity <= 0 {
+		return nil, fmt.Errorf("capacity must be greater than 0")
+	}
+
 	counts, err := lru.New[kvblock.BlockHash, int](capacity)
 	if err != nil {
 		return nil, err
@@ -84,12 +91,25 @@ func NewCheckpointAccumulator(stride, capacity int) (*CheckpointAccumulator, err
 	return &CheckpointAccumulator{counts: counts, stride: stride}, nil
 }
 
-// Accumulate adds blocks and returns (newCount, crossedBoundary).
-func (a *CheckpointAccumulator) Accumulate(parentKey kvblock.BlockHash, numBlocks int) (int, bool) {
+// Accumulate adds blocks and returns the previous count, new count, and the
+// checkpoint offsets crossed within this event slice.
+func (a *CheckpointAccumulator) Accumulate(parentKey kvblock.BlockHash, numBlocks int) (int, int, []int) {
 	current, _ := a.counts.Get(parentKey)
+	if numBlocks <= 0 {
+		return current, current, nil
+	}
+
 	newCount := current + numBlocks
-	crossed := (current / a.stride) != (newCount / a.stride) // XXX: Simplify
-	return newCount, crossed
+	checkpointOffsets := make([]int, 0)
+
+	for checkpoint := ((current / a.stride) + 1) * a.stride; checkpoint <= newCount; checkpoint += a.stride {
+		offset := checkpoint - current - 1
+		if offset >= 0 && offset < numBlocks {
+			checkpointOffsets = append(checkpointOffsets, offset)
+		}
+	}
+
+	return current, newCount, checkpointOffsets
 }
 
 // Update stores the new count keyed by the latest request key.
@@ -115,6 +135,58 @@ func DefaultConfig() *Config {
 	}
 }
 
+// gpuBatchData holds token data from a GPU event, used to resolve storage events.
+type gpuBatchData struct {
+	parentRequestKey kvblock.BlockHash
+	tokens           []uint32
+	modelName        string
+}
+
+type PoolOption func(*Pool)
+
+func WithStorageIndex(
+	storageIndex kvblock.Index,
+	accumulator *CheckpointAccumulator,
+	storageBlockSize int,
+	gpuTokenCacheCapacity int,
+) (PoolOption, error) {
+	if storageIndex == nil {
+		return nil, fmt.Errorf("storageIndex must not be nil")
+	}
+	if accumulator == nil {
+		return nil, fmt.Errorf("storageAccumulator must not be nil")
+	}
+	if storageBlockSize <= 0 {
+		return nil, fmt.Errorf("storageBlockSize must be greater than 0")
+	}
+	if gpuTokenCacheCapacity <= 0 {
+		return nil, fmt.Errorf("gpuTokenCacheCapacity must be greater than 0")
+	}
+	cache, err := lru.New[kvblock.BlockHash, *gpuBatchData](gpuTokenCacheCapacity)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gpu token cache: %w", err)
+	}
+
+	return func(p *Pool) {
+		p.storageIndex = storageIndex
+		p.storageAccumulator = accumulator
+		p.storageBlockSize = storageBlockSize
+		p.gpuTokenCache = cache
+	}, nil
+}
+
+func WithStorageConfig(
+	storageIndex kvblock.Index,
+	storageBlockSize, checkpointStride, accumulatorCapacity, gpuTokenCacheCapacity int,
+) (PoolOption, error) {
+	accumulator, err := NewCheckpointAccumulator(checkpointStride, accumulatorCapacity)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create storage accumulator: %w", err)
+	}
+
+	return WithStorageIndex(storageIndex, accumulator, storageBlockSize, gpuTokenCacheCapacity)
+}
+
 // Pool is a sharded worker pool that processes events from ZMQ subscribers.
 // It ensures that events for the same PodIdentifier are processed in order.
 // Pool is stateless — all key mappings are delegated to the Index.
@@ -127,13 +199,15 @@ type Pool struct {
 	wg                 sync.WaitGroup
 	storageIndex       kvblock.Index
 	storageAccumulator *CheckpointAccumulator
+	storageBlockSize   int
+	gpuTokenCache      *lru.Cache[kvblock.BlockHash, *gpuBatchData]
 }
 
 // NewPool creates a Pool with a sharded worker setup.
 // Subscribers are managed by SubscriberManager which is controlled by the pod
 // reconciler.
 func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProcessor,
-	adapter EngineAdapter,
+	adapter EngineAdapter, opts ...PoolOption,
 ) *Pool {
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -151,7 +225,37 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		p.queues[i] = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*RawMessage]())
 	}
 
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(p)
+	}
+
 	return p
+}
+
+func (p *Pool) lookupStorageTokenData(engineKeys []kvblock.BlockHash) (*gpuBatchData, bool) {
+	if p.gpuTokenCache == nil {
+		return nil, false
+	}
+
+	var data *gpuBatchData
+	for _, engineKey := range engineKeys {
+		cached, ok := p.gpuTokenCache.Get(engineKey)
+		if !ok {
+			continue
+		}
+		if data == nil {
+			data = cached
+			continue
+		}
+		if data != cached {
+			return nil, false
+		}
+	}
+
+	return data, data != nil
 }
 
 // Start begins the worker pool.
@@ -342,22 +446,18 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 				if len(requestKeys) > 0 {
 					lastKey := requestKeys[len(requestKeys)-1]
-					count, crossed := p.storageAccumulator.Accumulate(parentRequestKey, len(requestKeys))
-					p.storageAccumulator.Update(lastKey, count)
+					_, newCount, checkpointOffsets := p.storageAccumulator.Accumulate(parentRequestKey, len(requestKeys))
+					p.storageAccumulator.Update(lastKey, newCount)
 
-					if crossed {
-						// Insert checkpoint keys at stride boundary via Index.Add
-						checkpointPos := (count/p.storageAccumulator.stride)*p.storageAccumulator.stride - 1
-						if checkpointPos >= 0 && checkpointPos < len(requestKeys) {
-							storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
-							cpEngineKeys := []kvblock.BlockHash{engineKeys[checkpointPos]}
-							cpRequestKeys := []kvblock.BlockHash{requestKeys[checkpointPos]}
-							if err := p.storageIndex.Add(ctx, cpEngineKeys, cpRequestKeys, storageEntries); err != nil {
-								debugLogger.Error(err, "Failed to add storage checkpoint to index",
-									"podIdentifier", podIdentifier,
-									"engineKey", engineKeys[checkpointPos],
-									"requestKey", requestKeys[checkpointPos])
-							}
+					storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
+					for _, offset := range checkpointOffsets {
+						cpEngineKeys := []kvblock.BlockHash{engineKeys[offset]}
+						cpRequestKeys := []kvblock.BlockHash{requestKeys[offset]}
+						if err := p.storageIndex.Add(ctx, cpEngineKeys, cpRequestKeys, storageEntries); err != nil {
+							debugLogger.Error(err, "Failed to add storage checkpoint to index",
+								"podIdentifier", podIdentifier,
+								"engineKey", engineKeys[offset],
+								"requestKey", requestKeys[offset])
 						}
 					}
 				}

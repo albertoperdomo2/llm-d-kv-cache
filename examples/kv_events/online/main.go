@@ -55,6 +55,12 @@ const (
 
 	envHTTPPort     = "HTTP_PORT"
 	defaultHTTPPort = "8080"
+
+	envStorageIndexEnabled = "STORAGE_INDEX_ENABLED"
+	envStorageBlockSize    = "STORAGE_BLOCK_SIZE"
+	envCheckpointStride    = "STORAGE_CHECKPOINT_STRIDE"
+	envStorageWeight       = "STORAGE_WEIGHT"
+	envStorageMinPrefix    = "STORAGE_MIN_PREFIX_BLOCKS"
 )
 
 // ChatCompletionsRequest holds the fields needed for chat-completions rendering.
@@ -99,8 +105,9 @@ func run(ctx context.Context) error {
 	}
 
 	// Setup events pool
-	eventsPool, err := setupEventsPool(ctx, kvCacheIndexer.KVBlockIndex())
+	eventsPool, err := setupEventsPool(ctx, kvCacheIndexer)
 	if err != nil {
+		logger.Error(err, "failed to setup events pool")
 		return err
 	}
 	eventsPool.Start(ctx)
@@ -143,8 +150,37 @@ func getKVCacheIndexerConfig() (*kvcache.Config, error) {
 
 	config.KVBlockIndexConfig.EnableMetrics = true
 	config.KVBlockIndexConfig.MetricsLoggingInterval = 30 * time.Second
+	applyStorageExampleConfig(config)
 
 	return config, nil
+}
+
+func applyStorageExampleConfig(config *kvcache.Config) {
+	if config == nil {
+		return
+	}
+
+	storageCfg := config.StorageConfig
+	if storageCfg == nil {
+		storageCfg = kvcache.DefaultStorageConfig()
+		config.StorageConfig = storageCfg
+	}
+
+	if enabled, err := strconv.ParseBool(os.Getenv(envStorageIndexEnabled)); err == nil {
+		storageCfg.Enabled = enabled
+	}
+	if blockSize, err := strconv.Atoi(os.Getenv(envStorageBlockSize)); err == nil && blockSize > 0 {
+		storageCfg.StorageBlockSize = blockSize
+	}
+	if stride, err := strconv.Atoi(os.Getenv(envCheckpointStride)); err == nil && stride > 0 {
+		storageCfg.CheckpointStride = stride
+	}
+	if minPrefix, err := strconv.Atoi(os.Getenv(envStorageMinPrefix)); err == nil && minPrefix > 0 {
+		storageCfg.MinPrefixBlocks = minPrefix
+	}
+	if weight, err := strconv.ParseFloat(os.Getenv(envStorageWeight), 64); err == nil && weight >= 0 {
+		storageCfg.StorageWeight = weight
+	}
 }
 
 func getTokenProcessorConfig() *kvblock.TokenProcessorConfig {
@@ -194,7 +230,10 @@ func setupKVCacheIndexer(ctx context.Context) (*kvcache.Indexer, error) {
 		return nil, err
 	}
 
-	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(getTokenProcessorConfig())
+	tokenProcessorConfig := getTokenProcessorConfig()
+	cfg.TokenProcessorConfig = tokenProcessorConfig
+
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenProcessorConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -212,24 +251,42 @@ func setupKVCacheIndexer(ctx context.Context) (*kvcache.Indexer, error) {
 	return kvCacheIndexer, nil
 }
 
-func setupEventsPool(ctx context.Context, kvBlockIndex kvblock.Index) (*kvevents.Pool, error) {
+func setupEventsPool(ctx context.Context, indexer *kvcache.Indexer) (*kvevents.Pool, error) {
 	logger := log.FromContext(ctx)
 
 	cfg := getEventsPoolConfig()
 
 	logger.Info("Creating events pool", "config", cfg)
-	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	tokenProcessorConfig := indexer.TokenProcessorConfig()
+	if tokenProcessorConfig == nil {
+		tokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
+	}
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenProcessorConfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create token processor: %w", err)
 	}
 	adapter, err := engineadapter.NewAdapter(cfg.EngineType)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create engine adapter: %w", err)
 	}
 
-	pool := kvevents.NewPool(cfg, kvBlockIndex, tokenProcessor, adapter)
+	var opts []kvevents.PoolOption
+	storageCfg := indexer.StorageConfig()
+	if storageCfg != nil && storageCfg.Enabled {
+		opt, err := kvevents.WithStorageConfig(
+			indexer.StorageIndex(),
+			storageCfg.StorageBlockSize,
+			storageCfg.CheckpointStride,
+			storageCfg.AccumulatorCapacity,
+			storageCfg.GPUTokenCacheCapacity,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build storage pool option: %w", err)
+		}
+		opts = append(opts, opt)
+	}
 
-	return pool, nil
+	return kvevents.NewPool(cfg, indexer.KVBlockIndex(), tokenProcessor, adapter, opts...), nil
 }
 
 func setupUnifiedHTTPEndpoints(

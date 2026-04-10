@@ -126,7 +126,23 @@ func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePr
 		return nil, fmt.Errorf("failed to create engine adapter: %w", err)
 	}
 
-	pool := kvevents.NewPool(config.KVEventsConfig, kvCacheIndexer.KVBlockIndex(), tokenProcessor, adapter)
+	var opts []kvevents.PoolOption
+	storageCfg := kvCacheIndexer.StorageConfig()
+	if storageCfg != nil && storageCfg.Enabled {
+		opt, err := kvevents.WithStorageConfig(
+			kvCacheIndexer.StorageIndex(),
+			storageCfg.StorageBlockSize,
+			storageCfg.CheckpointStride,
+			storageCfg.AccumulatorCapacity,
+			storageCfg.GPUTokenCacheCapacity,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure storage event pool: %w", err)
+		}
+		opts = append(opts, opt)
+	}
+
+	pool := kvevents.NewPool(config.KVEventsConfig, kvCacheIndexer.KVBlockIndex(), tokenProcessor, adapter, opts...)
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)

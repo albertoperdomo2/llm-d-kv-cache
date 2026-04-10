@@ -38,10 +38,12 @@ import (
 // The configuration cover the different components found in the Indexer
 // module.
 type Config struct {
-	KVBlockIndexConfig   *kvblock.IndexConfig    `json:"kvBlockIndexConfig"`
-	KVBlockScorerConfig  *KVBlockScorerConfig    // not exported
-	TokenizersPoolConfig *tokenization.Config    `json:"tokenizersPoolConfig"`
-	BackendConfigs       []*KVCacheBackendConfig `json:"kvCacheBackendConfigs"`
+	KVBlockIndexConfig   *kvblock.IndexConfig          `json:"kvBlockIndexConfig"`
+	KVBlockScorerConfig  *KVBlockScorerConfig          // not exported
+	TokenizersPoolConfig *tokenization.Config          `json:"tokenizersPoolConfig"`
+	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
+	BackendConfigs       []*KVCacheBackendConfig       `json:"kvCacheBackendConfigs"`
+	StorageConfig        *StorageConfig                `json:"storageConfig,omitempty"`
 }
 
 // NewDefaultConfig returns a default configuration for the Indexer module.
@@ -56,19 +58,67 @@ func NewDefaultConfig() (*Config, error) {
 		KVBlockScorerConfig:  DefaultKVBlockScorerConfig(),
 		TokenizersPoolConfig: tokenizerPoolConfig,
 		BackendConfigs:       DefaultKVCacheBackendConfig(),
+		StorageConfig:        DefaultStorageConfig(),
 	}, nil
 }
 
 // StorageConfig holds configuration for the storage checkpoint scoring path.
 type StorageConfig struct {
-	// StorageBlockSize is the number of tokens per storage block (e.g., 256).
-	StorageBlockSize int `json:"storageBlockSize"`
-	// CheckpointStride is the number of storage blocks between checkpoint samples.
-	CheckpointStride int `json:"checkpointStride"`
-	// StorageWeight is the scoring weight for storage coverage beyond the GPU prefix.
-	StorageWeight float64 `json:"storageWeight"`
-	// MinPrefixBlocks is the minimum number of storage blocks for the storage bonus to apply.
-	MinPrefixBlocks int `json:"minPrefixBlocks"`
+	Enabled               bool    `json:"enabled"`
+	StorageBlockSize      int     `json:"storageBlockSize"`
+	CheckpointStride      int     `json:"checkpointStride"`
+	StorageWeight         float64 `json:"storageWeight"`
+	MinPrefixBlocks       int     `json:"minPrefixBlocks"`
+	FilterCapacity        uint    `json:"filterCapacity"`
+	EngineKeyMapSize      int     `json:"engineKeyMapSize"`
+	AccumulatorCapacity   int     `json:"accumulatorCapacity"`
+	GPUTokenCacheCapacity int     `json:"gpuTokenCacheCapacity"`
+}
+
+// DefaultStorageConfig returns a default storage configuration.
+func DefaultStorageConfig() *StorageConfig {
+	return &StorageConfig{
+		Enabled:               false,
+		StorageBlockSize:      256,
+		CheckpointStride:      64,
+		StorageWeight:         0.3,
+		MinPrefixBlocks:       1,
+		FilterCapacity:        1e7,
+		EngineKeyMapSize:      1e7,
+		AccumulatorCapacity:   1e6,
+		GPUTokenCacheCapacity: 1e6,
+	}
+}
+
+func validateStorageConfig(cfg *StorageConfig, gpuBlockSize int) error {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	if cfg.StorageBlockSize <= 0 {
+		return fmt.Errorf("storageBlockSize must be greater than 0")
+	}
+	if cfg.CheckpointStride <= 0 {
+		return fmt.Errorf("checkpointStride must be greater than 0")
+	}
+	if cfg.AccumulatorCapacity <= 0 {
+		return fmt.Errorf("accumulatorCapacity must be greater than 0")
+	}
+	if cfg.GPUTokenCacheCapacity <= 0 {
+		return fmt.Errorf("gpuTokenCacheCapacity must be greater than 0")
+	}
+	if cfg.FilterCapacity == 0 {
+		return fmt.Errorf("filterCapacity must be greater than 0")
+	}
+	if cfg.EngineKeyMapSize <= 0 {
+		return fmt.Errorf("engineKeyMapSize must be greater than 0")
+	}
+	if gpuBlockSize <= 0 {
+		return fmt.Errorf("gpu block size must be greater than 0")
+	}
+	if cfg.StorageBlockSize%gpuBlockSize != 0 {
+		return fmt.Errorf("storageBlockSize must be a multiple of gpu block size")
+	}
+	return nil
 }
 
 // Indexer is a concrete implementation of the KVCacheIndex interface.
@@ -92,6 +142,14 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 	}
 	if tokenProcessor == nil {
 		return nil, fmt.Errorf("tokenProcessor cannot be nil")
+	}
+
+	blockSize := kvblock.DefaultTokenProcessorConfig().BlockSize
+	if config.TokenProcessorConfig != nil && config.TokenProcessorConfig.BlockSize > 0 {
+		blockSize = config.TokenProcessorConfig.BlockSize
+	}
+	if err := validateStorageConfig(config.StorageConfig, blockSize); err != nil {
+		return nil, fmt.Errorf("invalid storage config: %w", err)
 	}
 
 	kvBlockIndex, err := kvblock.NewIndex(ctx, config.KVBlockIndexConfig)
@@ -119,12 +177,29 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 		return nil, fmt.Errorf("failed to create tokenizers pool: %w", err)
 	}
 
+	var storageIndex kvblock.Index
+	if config.StorageConfig != nil && config.StorageConfig.Enabled {
+		storageIndex, err = kvblock.NewCuckooStorageIndex(&kvblock.CuckooStorageIndexConfig{
+			FilterCapacity:   config.StorageConfig.FilterCapacity,
+			EngineKeyMapSize: config.StorageConfig.EngineKeyMapSize,
+			DefaultEntries: []kvblock.PodEntry{
+				{PodIdentifier: "shared-storage", DeviceTier: "storage"},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create storage index: %w", err)
+		}
+		storageIndex = kvblock.NewTracedIndex(storageIndex)
+	}
+
 	return &Indexer{
 		config:         config,
 		tokenProcessor: tokenProcessor,
 		kvBlockIndex:   kvBlockIndex,
 		kvBlockScorer:  scorer,
 		tokenizersPool: tokenizersPool,
+		storageIndex:   storageIndex,
+		storageConfig:  config.StorageConfig,
 	}, nil
 }
 
@@ -136,6 +211,24 @@ func (k *Indexer) Run(ctx context.Context) {
 // KVBlockIndex returns the kvblock.Index used by the Indexer.
 func (k *Indexer) KVBlockIndex() kvblock.Index {
 	return k.kvBlockIndex
+}
+
+// StorageIndex returns the storage index used by the Indexer, if configured.
+func (k *Indexer) StorageIndex() kvblock.Index {
+	return k.storageIndex
+}
+
+// StorageConfig returns the storage configuration used by the Indexer, if configured.
+func (k *Indexer) StorageConfig() *StorageConfig {
+	return k.storageConfig
+}
+
+// TokenProcessorConfig returns the token processor configuration associated with this indexer.
+func (k *Indexer) TokenProcessorConfig() *kvblock.TokenProcessorConfig {
+	if k.config == nil {
+		return nil
+	}
+	return k.config.TokenProcessorConfig
 }
 
 // ComputeBlockKeys computes the KV-block keys for a given prompt and model name.

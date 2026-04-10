@@ -672,33 +672,33 @@ func TestCheckpointAccumulator_TracksCountsAcrossEvents(t *testing.T) {
 	prefix := kvblock.BlockHash(100) // simulates initial parentRequestKey
 
 	// Event 1: 1 block. Count: 0->1. No crossing.
-	count, crossed := acc.Accumulate(prefix, 1)
-	assert.Equal(t, 1, count)
-	assert.False(t, crossed)
+	_, newCount, offsets := acc.Accumulate(prefix, 1)
+	assert.Equal(t, 1, newCount)
+	assert.Empty(t, offsets)
 
 	// Update stores count under the LAST request key,
 	// which becomes the next event's parent.
 	lastKey1 := kvblock.BlockHash(200)
-	acc.Update(lastKey1, count)
+	acc.Update(lastKey1, newCount)
 
 	// Event 2: 1 block, parent is lastKey1. Count: 1->2.
-	count, crossed = acc.Accumulate(lastKey1, 1)
-	assert.Equal(t, 2, count)
-	assert.False(t, crossed)
+	_, newCount, offsets = acc.Accumulate(lastKey1, 1)
+	assert.Equal(t, 2, newCount)
+	assert.Empty(t, offsets)
 
 	lastKey2 := kvblock.BlockHash(300)
-	acc.Update(lastKey2, count)
+	acc.Update(lastKey2, newCount)
 
 	// Event 3: 1 block, parent is lastKey2. Count: 2->3.
-	count, crossed = acc.Accumulate(lastKey2, 1)
-	assert.Equal(t, 3, count)
-	assert.False(t, crossed)
+	_, newCount, offsets = acc.Accumulate(lastKey2, 1)
+	assert.Equal(t, 3, newCount)
+	assert.Empty(t, offsets)
 
 	lastKey3 := kvblock.BlockHash(400)
-	acc.Update(lastKey3, count)
+	acc.Update(lastKey3, newCount)
 
 	// Event 4: 1 block, parent is lastKey3. Count: 3->4. Crosses stride=4!
-	count, crossed = acc.Accumulate(lastKey3, 1)
-	assert.Equal(t, 4, count)
-	assert.True(t, crossed, "should cross stride boundary at count=4")
+	_, newCount, offsets = acc.Accumulate(lastKey3, 1)
+	assert.Equal(t, 4, newCount)
+	assert.Len(t, offsets, 1, "should cross stride boundary at count=4")
 }

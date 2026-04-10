@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/llm-d/llm-d-kv-cache/examples/testdata"
+	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents/engineadapter"
@@ -110,14 +111,19 @@ func SimulateRemoveEvent(ctx context.Context, publisher *Publisher) error {
 	return nil
 }
 
-func SetupEventsPool(ctx context.Context, kvBlockIndex kvblock.Index) (*kvevents.Pool, error) {
+func SetupEventsPool(ctx context.Context, indexer *kvcache.Indexer) (*kvevents.Pool, error) {
 	logger := log.FromContext(ctx)
 
 	cfg := kvevents.DefaultConfig()
 
 	logger.Info("Creating events pool", "config", cfg)
 
-	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	tokenProcessorConfig := indexer.TokenProcessorConfig()
+	if tokenProcessorConfig == nil {
+		tokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
+	}
+
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenProcessorConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token processor: %w", err)
 	}
@@ -127,7 +133,21 @@ func SetupEventsPool(ctx context.Context, kvBlockIndex kvblock.Index) (*kvevents
 		return nil, fmt.Errorf("failed to create engine adapter: %w", err)
 	}
 
-	pool := kvevents.NewPool(cfg, kvBlockIndex, tokenProcessor, adapter)
+	var opts []kvevents.PoolOption
+	storageCfg := indexer.StorageConfig()
+	if storageCfg != nil && storageCfg.Enabled {
+		opt, err := kvevents.WithStorageConfig(
+			indexer.StorageIndex(),
+			storageCfg.StorageBlockSize,
+			storageCfg.CheckpointStride,
+			storageCfg.AccumulatorCapacity,
+			storageCfg.GPUTokenCacheCapacity,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build storage pool option: %w", err)
+		}
+		opts = append(opts, opt)
+	}
 
-	return pool, nil
+	return kvevents.NewPool(cfg, indexer.KVBlockIndex(), tokenProcessor, adapter, opts...), nil
 }

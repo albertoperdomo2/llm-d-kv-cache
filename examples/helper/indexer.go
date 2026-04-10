@@ -18,6 +18,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"strconv"
 
 	"github.com/llm-d/llm-d-kv-cache/examples/testdata"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache"
@@ -31,6 +32,12 @@ const (
 	// Use a path (e.g. /tmp/tokenizer/tokenizer-uds.socket) for UDS mode,
 	// or host:port (e.g. localhost:50051) for TCP mode.
 	EnvTokenizerEndpoint = "TOKENIZER_ENDPOINT" //nolint:gosec // env var name, not a credential
+
+	envStorageIndexEnabled    = "STORAGE_INDEX_ENABLED"
+	envStorageBlockSize       = "STORAGE_BLOCK_SIZE"
+	envCheckpointStride       = "STORAGE_CHECKPOINT_STRIDE"
+	envStorageWeight          = "STORAGE_WEIGHT"
+	envStorageMinPrefixBlocks = "STORAGE_MIN_PREFIX_BLOCKS"
 )
 
 func isTCPAddr(s string) bool {
@@ -58,8 +65,37 @@ func getKVCacheIndexerConfig() (*kvcache.Config, error) {
 
 	config.TokenizersPoolConfig.ModelName = testdata.ModelName
 	ApplyTokenizerEndpoint(config)
+	applyStorageExampleConfig(config)
 
 	return config, nil
+}
+
+func applyStorageExampleConfig(config *kvcache.Config) {
+	if config == nil {
+		return
+	}
+
+	storageCfg := config.StorageConfig
+	if storageCfg == nil {
+		storageCfg = kvcache.DefaultStorageConfig()
+		config.StorageConfig = storageCfg
+	}
+
+	if enabled, err := strconv.ParseBool(os.Getenv(envStorageIndexEnabled)); err == nil {
+		storageCfg.Enabled = enabled
+	}
+	if blockSize, err := strconv.Atoi(os.Getenv(envStorageBlockSize)); err == nil && blockSize > 0 {
+		storageCfg.StorageBlockSize = blockSize
+	}
+	if stride, err := strconv.Atoi(os.Getenv(envCheckpointStride)); err == nil && stride > 0 {
+		storageCfg.CheckpointStride = stride
+	}
+	if minPrefix, err := strconv.Atoi(os.Getenv(envStorageMinPrefixBlocks)); err == nil && minPrefix > 0 {
+		storageCfg.MinPrefixBlocks = minPrefix
+	}
+	if weight, err := strconv.ParseFloat(os.Getenv(envStorageWeight), 64); err == nil && weight >= 0 {
+		storageCfg.StorageWeight = weight
+	}
 }
 
 func getTokenProcessorConfig() *kvblock.TokenProcessorConfig {
@@ -76,7 +112,10 @@ func SetupKVCacheIndexer(ctx context.Context) (*kvcache.Indexer, error) {
 		return nil, err
 	}
 
-	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(getTokenProcessorConfig())
+	tokenProcessorConfig := getTokenProcessorConfig()
+	cfg.TokenProcessorConfig = tokenProcessorConfig
+
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenProcessorConfig)
 	if err != nil {
 		return nil, err
 	}
