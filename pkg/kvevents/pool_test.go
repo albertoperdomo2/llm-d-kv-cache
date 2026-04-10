@@ -640,7 +640,7 @@ func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 2)
 
-	// count=2, stride=2 → checkpointPos = (2/2)*2 - 1 = 1
+	// count=2, stride=2 → checkpoint at offset 1 → canonicalKeys[1]
 	checkpointKey := canonicalKeys[1]
 
 	// Verify it's in the storage index
@@ -648,7 +648,7 @@ func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, podsPerKey, checkpointKey)
 
-	// Remove path: Block removed event
+	// Remove path: evict using the engine key that was stored at checkpoint offset
 	batch = &EventBatch{
 		Events: []GenericEvent{
 			&BlockRemovedEvent{
@@ -665,6 +665,40 @@ func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
 	assert.Empty(t, podsPerKey, "checkpoint should be gone after eviction")
 }
 
+func TestCheckpointAccumulator_ReturnsCheckpointOffsets(t *testing.T) {
+	acc, err := NewCheckpointAccumulator(4, 1000)
+	require.NoError(t, err)
+
+	t.Run("old count 3, event size 2 inserts offset 0", func(t *testing.T) {
+		parentKey := kvblock.BlockHash(100)
+		acc.counts.Add(parentKey, 3)
+
+		oldCount, newCount, offsets := acc.Accumulate(parentKey, 2)
+		assert.Equal(t, 3, oldCount)
+		assert.Equal(t, 5, newCount)
+		assert.Equal(t, []int{0}, offsets)
+	})
+
+	t.Run("old count 0, event size 8 inserts offsets 3 and 7", func(t *testing.T) {
+		parentKey := kvblock.BlockHash(200)
+
+		oldCount, newCount, offsets := acc.Accumulate(parentKey, 8)
+		assert.Equal(t, 0, oldCount)
+		assert.Equal(t, 8, newCount)
+		assert.Equal(t, []int{3, 7}, offsets)
+	})
+
+	t.Run("old count 2, event size 1 inserts nothing", func(t *testing.T) {
+		parentKey := kvblock.BlockHash(300)
+		acc.counts.Add(parentKey, 2)
+
+		oldCount, newCount, offsets := acc.Accumulate(parentKey, 1)
+		assert.Equal(t, 2, oldCount)
+		assert.Equal(t, 3, newCount)
+		assert.Empty(t, offsets)
+	})
+}
+
 func TestCheckpointAccumulator_TracksCountsAcrossEvents(t *testing.T) {
 	acc, err := NewCheckpointAccumulator(4, 1000) // stride=4
 	require.NoError(t, err)
@@ -672,33 +706,44 @@ func TestCheckpointAccumulator_TracksCountsAcrossEvents(t *testing.T) {
 	prefix := kvblock.BlockHash(100) // simulates initial parentRequestKey
 
 	// Event 1: 1 block. Count: 0->1. No crossing.
-	_, newCount, offsets := acc.Accumulate(prefix, 1)
-	assert.Equal(t, 1, newCount)
+	oldCount, count, offsets := acc.Accumulate(prefix, 1)
+	assert.Equal(t, 0, oldCount)
+	assert.Equal(t, 1, count)
 	assert.Empty(t, offsets)
 
 	// Update stores count under the LAST request key,
 	// which becomes the next event's parent.
 	lastKey1 := kvblock.BlockHash(200)
-	acc.Update(lastKey1, newCount)
+	acc.Update(lastKey1, count)
 
 	// Event 2: 1 block, parent is lastKey1. Count: 1->2.
-	_, newCount, offsets = acc.Accumulate(lastKey1, 1)
-	assert.Equal(t, 2, newCount)
+	oldCount, count, offsets = acc.Accumulate(lastKey1, 1)
+	assert.Equal(t, 1, oldCount)
+	assert.Equal(t, 2, count)
 	assert.Empty(t, offsets)
 
 	lastKey2 := kvblock.BlockHash(300)
-	acc.Update(lastKey2, newCount)
+	acc.Update(lastKey2, count)
 
 	// Event 3: 1 block, parent is lastKey2. Count: 2->3.
-	_, newCount, offsets = acc.Accumulate(lastKey2, 1)
-	assert.Equal(t, 3, newCount)
+	oldCount, count, offsets = acc.Accumulate(lastKey2, 1)
+	assert.Equal(t, 2, oldCount)
+	assert.Equal(t, 3, count)
 	assert.Empty(t, offsets)
 
 	lastKey3 := kvblock.BlockHash(400)
-	acc.Update(lastKey3, newCount)
+	acc.Update(lastKey3, count)
 
 	// Event 4: 1 block, parent is lastKey3. Count: 3->4. Crosses stride=4!
-	_, newCount, offsets = acc.Accumulate(lastKey3, 1)
-	assert.Equal(t, 4, newCount)
-	assert.Len(t, offsets, 1, "should cross stride boundary at count=4")
+	oldCount, count, offsets = acc.Accumulate(lastKey3, 1)
+	assert.Equal(t, 3, oldCount)
+	assert.Equal(t, 4, count)
+	assert.Equal(t, []int{0}, offsets, "should cross stride boundary at count=4")
+
+	lastKey4 := kvblock.BlockHash(500)
+	acc.Update(lastKey4, count)
+
+	storedCount, ok := acc.counts.Get(lastKey4)
+	require.True(t, ok)
+	assert.Equal(t, 4, storedCount)
 }

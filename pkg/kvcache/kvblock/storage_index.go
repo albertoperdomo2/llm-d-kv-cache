@@ -65,7 +65,6 @@ func NewCuckooStorageIndex(cfg *CuckooStorageIndexConfig) (*CuckooStorageIndex, 
 	}
 	if len(cfg.DefaultEntries) == 0 {
 		return nil, fmt.Errorf("defaultEntries must not be empty")
-
 	}
 
 	engineMap, err := lru.New[BlockHash, BlockHash](cfg.EngineKeyMapSize)
@@ -135,7 +134,8 @@ func (c *CuckooStorageIndex) GetRequestKey(_ context.Context, engineKey BlockHas
 }
 
 // Lookup checks each request against the Cuckoo filter.
-// It returns all the keys, since no filtering is either needed nor make sense for shared storage.
+// For the current shared-storage MVP, podIdentifierSet is intentionally ignored:
+// every hit maps to the shared storage entry for all pods.
 func (c *CuckooStorageIndex) Lookup(ctx context.Context, requestKeys []BlockHash, _ sets.Set[string]) (map[BlockHash][]PodEntry, error) {
 	if len(requestKeys) == 0 {
 		return nil, fmt.Errorf("no keys provided for lookup")
@@ -164,8 +164,8 @@ func (c *CuckooStorageIndex) Lookup(ctx context.Context, requestKeys []BlockHash
 }
 
 // Evict removes a key from the Cuckoo filter.
-// For EngineKey type, resolves to requestKey via de internal LRU first
-// Note: Cuckoo filter removes the entire key, no partial eviction is not supported nor needed.
+// For EngineKey type, it first resolves the requestKey via the internal LRU.
+// Note: Cuckoo filter removes the entire key, no partial eviction is supported or needed.
 func (c *CuckooStorageIndex) Evict(ctx context.Context, key BlockHash, keyType KeyType, _ []PodEntry) error {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.CuckooStorageIndex.Evict")
 

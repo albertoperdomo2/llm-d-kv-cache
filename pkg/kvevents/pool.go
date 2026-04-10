@@ -417,8 +417,10 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				engineKeys[i] = kvblock.BlockHash(hash)
 			}
 
+			storageTier := isStorageTier(deviceTier) && p.storageIndex != nil
+
 			parentRequestKey := kvblock.EmptyBlockHash
-			if ev.ParentHash != 0 {
+			if !storageTier && ev.ParentHash != 0 {
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
 				// Try GPU/CPU index first, then storage index
 				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
@@ -433,7 +435,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				parentRequestKey = key
 			}
 
-			if isStorageTier(deviceTier) && p.storageIndex != nil {
+			if storageTier {
 				// Storage path: checkpoint accumulation using canonical block keys.
 				// Storage events are text-only, no extraFeatures.
 				requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
@@ -451,6 +453,12 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 					storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
 					for _, offset := range checkpointOffsets {
+						if offset >= len(requestKeys) || offset >= len(engineKeys) {
+							debugLogger.Error(nil, "Storage checkpoint offset out of bounds",
+								"podIdentifier", podIdentifier, "offset", offset,
+								"requestKeyCount", len(requestKeys), "engineKeyCount", len(engineKeys))
+							continue
+						}
 						cpEngineKeys := []kvblock.BlockHash{engineKeys[offset]}
 						cpRequestKeys := []kvblock.BlockHash{requestKeys[offset]}
 						if err := p.storageIndex.Add(ctx, cpEngineKeys, cpRequestKeys, storageEntries); err != nil {
@@ -545,7 +553,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				storageEntries := []kvblock.PodEntry{{PodIdentifier: "shared-storage", DeviceTier: "storage"}}
 				for _, hash := range ev.BlockHashes {
 					engineKey := kvblock.BlockHash(hash)
-					p.storageIndex.Evict(ctx, engineKey, kvblock.EngineKey, storageEntries)
+					if err := p.storageIndex.Evict(ctx, engineKey, kvblock.EngineKey, storageEntries); err != nil {
+						debugLogger.Error(err, "Failed to remove event from storage index",
+							"podIdentifier", podIdentifier, "engineKey", engineKey, "event", ev)
+						continue
+					}
 				}
 			} else {
 
@@ -579,4 +591,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 func isStorageTier(tier string) bool {
 	return tier == "shared_storage" || tier == "local_storage"
+}
+
+func isGPUTier(tier string) bool {
+	return strings.EqualFold(tier, "gpu")
 }

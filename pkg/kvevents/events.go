@@ -68,6 +68,7 @@ type BlockStoredEvent struct {
 	BlockHashes []uint64
 	Tokens      []uint32
 	ParentHash  uint64
+	BlockSize   int
 	DeviceTier  string
 	LoraID      *int
 	LoraName    *string

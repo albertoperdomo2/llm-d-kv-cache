@@ -88,6 +88,20 @@ func TestCuckooStorageIndex_LookupMiss(t *testing.T) {
 	assert.Empty(t, podsPerKey)
 }
 
+func TestCuckooStorageIndex_LookupIgnoresPodIdentifierSetForSharedStorage(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	idx := createCuckooStorageIndexForTesting(t)
+
+	requestKey := BlockHash(123456)
+	err := idx.Add(ctx, nil, []BlockHash{requestKey}, defaultStorageEntries)
+	require.NoError(t, err)
+
+	podsPerKey, err := idx.Lookup(ctx, []BlockHash{requestKey}, sets.New[string]("unrelated-pod"))
+	require.NoError(t, err)
+	require.Contains(t, podsPerKey, requestKey)
+	assert.ElementsMatch(t, defaultStorageEntries, podsPerKey[requestKey])
+}
+
 func TestCuckooStorageIndex_LookupEmptyRequestKeys(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
 	idx := createCuckooStorageIndexForTesting(t)

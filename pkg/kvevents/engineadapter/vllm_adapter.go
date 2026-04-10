@@ -176,7 +176,11 @@ func (v *VLLMAdapter) convertBlockStoredEvent(fields []any) (kvevents.GenericEve
 		return nil, fmt.Errorf("BlockStored: %w", err)
 	}
 
-	// [4] block_size — consumed but not stored in domain event
+	// [4] block_size
+	blockSize, err := toInt(fields[4])
+	if err != nil {
+		return nil, fmt.Errorf("BlockStored: block_size: %w", err)
+	}
 
 	// [5] lora_id (optional)
 	var loraID *int
@@ -225,6 +229,7 @@ func (v *VLLMAdapter) convertBlockStoredEvent(fields []any) (kvevents.GenericEve
 		BlockHashes: blockHashes,
 		Tokens:      tokens,
 		ParentHash:  parentHash,
+		BlockSize:   blockSize,
 		DeviceTier:  deviceTier,
 		LoraID:      loraID,
 		LoraName:    loraName,

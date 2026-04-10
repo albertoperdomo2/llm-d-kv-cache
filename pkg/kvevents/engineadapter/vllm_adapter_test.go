@@ -72,6 +72,7 @@ func TestVLLMParseMessage_Valid(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, []uint64{100, 101}, blockStored.BlockHashes)
 	assert.Equal(t, uint64(99), blockStored.ParentHash)
+	assert.Equal(t, 16, blockStored.BlockSize)
 }
 
 // TestVLLMParseMessage_InvalidPayload tests error handling for invalid msgpack data.
@@ -115,6 +116,7 @@ func TestVLLMBlockStored(t *testing.T) {
 	assert.Equal(t, []uint64{100, 101}, blockStored.BlockHashes)
 	assert.Equal(t, uint64(99), blockStored.ParentHash)
 	assert.Equal(t, []uint32{1, 2, 3}, blockStored.Tokens)
+	assert.Equal(t, 16, blockStored.BlockSize)
 	assert.Equal(t, "gpu", blockStored.DeviceTier)
 	assert.Nil(t, blockStored.LoraID)
 	assert.Nil(t, blockStored.LoraName)
@@ -149,6 +151,7 @@ func TestVLLMBlockStoredWithLora(t *testing.T) {
 	assert.Equal(t, []uint64{200, 201}, blockStored.BlockHashes)
 	assert.Equal(t, uint64(199), blockStored.ParentHash)
 	assert.Equal(t, []uint32{4, 5, 6}, blockStored.Tokens)
+	assert.Equal(t, 32, blockStored.BlockSize)
 	assert.Equal(t, "gpu", blockStored.DeviceTier)
 	require.NotNil(t, blockStored.LoraID)
 	assert.Equal(t, 42, *blockStored.LoraID)
@@ -224,6 +227,7 @@ func TestDecodeVLLMEvent_BlockStoredMissingTrailingFields(t *testing.T) {
 
 			blockStored, ok := event.(*kvevents.BlockStoredEvent)
 			require.True(t, ok)
+			assert.Equal(t, 64, blockStored.BlockSize)
 			assert.Equal(t, tt.wantLoraID, blockStored.LoraID)
 			assert.Equal(t, tt.wantMedium, blockStored.DeviceTier)
 			assert.Equal(t, tt.wantLora, blockStored.LoraName)
@@ -261,6 +265,7 @@ func TestDecodeVLLMEvent_BlockStoredExtraTrailingFields(t *testing.T) {
 	assert.Equal(t, []uint64{400, 401}, blockStored.BlockHashes)
 	assert.Equal(t, uint64(399), blockStored.ParentHash)
 	assert.Equal(t, []uint32{10, 11, 12}, blockStored.Tokens)
+	assert.Equal(t, 16, blockStored.BlockSize)
 	assert.Equal(t, "gpu", blockStored.DeviceTier)
 	assert.Nil(t, blockStored.LoraID)
 	require.NotNil(t, blockStored.LoraName)
