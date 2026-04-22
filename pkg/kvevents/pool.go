@@ -135,20 +135,23 @@ func DefaultConfig() *Config {
 	}
 }
 
-// gpuBatchData holds token data from a GPU event, used to resolve storage events.
-type gpuBatchData struct {
-	parentRequestKey kvblock.BlockHash
-	tokens           []uint32
-	modelName        string
-}
-
+// PoolOption is a functional option for configuring the Pool.
 type PoolOption func(*Pool)
 
+// gpuBatchData caches token data from GPU events so that storage events
+// (which arrive without tokens) can resolve them via engine key correlation.
+type gpuBatchData struct {
+	tokens           []uint32
+	modelName        string
+	parentRequestKey kvblock.BlockHash
+}
+
+// WithStorageIndex returns a PoolOption that wires a pre-built storage index,
+// checkpoint accumulator, and GPU token cache into the Pool.
 func WithStorageIndex(
 	storageIndex kvblock.Index,
 	accumulator *CheckpointAccumulator,
-	storageBlockSize int,
-	gpuTokenCacheCapacity int,
+	gpuTokenCache *lru.Cache[kvblock.BlockHash, *gpuBatchData],
 ) (PoolOption, error) {
 	if storageIndex == nil {
 		return nil, fmt.Errorf("storageIndex must not be nil")
@@ -156,35 +159,34 @@ func WithStorageIndex(
 	if accumulator == nil {
 		return nil, fmt.Errorf("storageAccumulator must not be nil")
 	}
-	if storageBlockSize <= 0 {
-		return nil, fmt.Errorf("storageBlockSize must be greater than 0")
-	}
-	if gpuTokenCacheCapacity <= 0 {
-		return nil, fmt.Errorf("gpuTokenCacheCapacity must be greater than 0")
-	}
-	cache, err := lru.New[kvblock.BlockHash, *gpuBatchData](gpuTokenCacheCapacity)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create gpu token cache: %w", err)
+	if gpuTokenCache == nil {
+		return nil, fmt.Errorf("gpuTokenCache must not be nil")
 	}
 
 	return func(p *Pool) {
 		p.storageIndex = storageIndex
 		p.storageAccumulator = accumulator
-		p.storageBlockSize = storageBlockSize
-		p.gpuTokenCache = cache
+		p.gpuTokenCache = gpuTokenCache
 	}, nil
 }
 
+// WithStorageConfig returns a PoolOption that creates a CheckpointAccumulator
+// and GPU token cache, then wires them with the storage index into the Pool.
 func WithStorageConfig(
 	storageIndex kvblock.Index,
-	storageBlockSize, checkpointStride, accumulatorCapacity, gpuTokenCacheCapacity int,
+	checkpointStride, accumulatorCapacity, gpuTokenCacheCapacity int,
 ) (PoolOption, error) {
 	accumulator, err := NewCheckpointAccumulator(checkpointStride, accumulatorCapacity)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage accumulator: %w", err)
 	}
 
-	return WithStorageIndex(storageIndex, accumulator, storageBlockSize, gpuTokenCacheCapacity)
+	gpuTokenCache, err := lru.New[kvblock.BlockHash, *gpuBatchData](gpuTokenCacheCapacity)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GPU token cache: %w", err)
+	}
+
+	return WithStorageIndex(storageIndex, accumulator, gpuTokenCache)
 }
 
 // Pool is a sharded worker pool that processes events from ZMQ subscribers.
@@ -199,7 +201,6 @@ type Pool struct {
 	wg                 sync.WaitGroup
 	storageIndex       kvblock.Index
 	storageAccumulator *CheckpointAccumulator
-	storageBlockSize   int
 	gpuTokenCache      *lru.Cache[kvblock.BlockHash, *gpuBatchData]
 }
 
@@ -233,29 +234,6 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	}
 
 	return p
-}
-
-func (p *Pool) lookupStorageTokenData(engineKeys []kvblock.BlockHash) (*gpuBatchData, bool) {
-	if p.gpuTokenCache == nil {
-		return nil, false
-	}
-
-	var data *gpuBatchData
-	for _, engineKey := range engineKeys {
-		cached, ok := p.gpuTokenCache.Get(engineKey)
-		if !ok {
-			continue
-		}
-		if data == nil {
-			data = cached
-			continue
-		}
-		if data != cached {
-			return nil, false
-		}
-	}
-
-	return data, data != nil
 }
 
 // Start begins the worker pool.
@@ -436,13 +414,20 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			if storageTier {
-				// Storage path: checkpoint accumulation using canonical block keys.
+				// Storage path: resolve tokens from GPU cache (storage events don't carry tokens).
+				data := p.lookupStorageTokenData(engineKeys)
+				if data == nil {
+					debugLogger.Info("No cached GPU data for storage event, skipping",
+						"podIdentifier", podIdentifier, "firstEngineKey", engineKeys[0])
+					continue
+				}
+
 				// Storage events are text-only, no extraFeatures.
 				requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
-					parentRequestKey, ev.Tokens, effectiveModelName, nil)
+					data.parentRequestKey, data.tokens, data.modelName, nil)
 				if err != nil {
 					debugLogger.Error(err, "Failed to generate request keys for storage event",
-						"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
+						"podIdentifier", podIdentifier, "effectiveModelName", data.modelName)
 					continue
 				}
 
@@ -540,6 +525,15 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 						"podIdentifier", podIdentifier, "event", ev)
 					continue
 				}
+
+				// Cache token data for later storage event correlation.
+				if p.gpuTokenCache != nil && len(engineKeys) > 0 {
+					p.gpuTokenCache.Add(engineKeys[0], &gpuBatchData{
+						tokens:           ev.Tokens,
+						modelName:        effectiveModelName,
+						parentRequestKey: parentRequestKey,
+					})
+				}
 			}
 
 		case *BlockRemovedEvent:
@@ -587,6 +581,20 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
 	}
+}
+
+// lookupStorageTokenData resolves token data for a storage event by looking up
+// the first engine key in the GPU token cache. Storage events arrive without
+// tokens; the tokens must have been cached from an earlier GPU event.
+func (p *Pool) lookupStorageTokenData(engineKeys []kvblock.BlockHash) *gpuBatchData {
+	if p.gpuTokenCache == nil || len(engineKeys) == 0 {
+		return nil
+	}
+	data, ok := p.gpuTokenCache.Get(engineKeys[0])
+	if !ok {
+		return nil
+	}
+	return data
 }
 
 func isStorageTier(tier string) bool {

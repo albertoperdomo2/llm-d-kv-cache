@@ -2,14 +2,52 @@ package kvevents //nolint:testpackage // tests use unexported processEventBatch
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-kv-cache/pkg/utils/logging"
 )
+
+var errFake = errors.New("fake error")
+
+// erroringIndex wraps a kvblock.Index and injects errors into Add/Evict calls.
+type erroringIndex struct {
+	kvblock.Index
+	addErr     error
+	evictErr   error
+	addCalls   int
+	evictCalls int
+}
+
+func (i *erroringIndex) Add(
+	ctx context.Context,
+	engineKeys, requestKeys []kvblock.BlockHash,
+	entries []kvblock.PodEntry,
+) error {
+	i.addCalls++
+	if i.addErr != nil {
+		return i.addErr
+	}
+	return i.Index.Add(ctx, engineKeys, requestKeys, entries)
+}
+
+func (i *erroringIndex) Evict(
+	ctx context.Context,
+	key kvblock.BlockHash,
+	keyType kvblock.KeyType,
+	entries []kvblock.PodEntry,
+) error {
+	i.evictCalls++
+	if i.evictErr != nil {
+		return i.evictErr
+	}
+	return i.Index.Evict(ctx, key, keyType, entries)
+}
 
 // newTestPool creates a Pool with real InMemoryIndex and
 // ChunkedTokenDatabase. blockSize is the canonical block size used by the
@@ -34,7 +72,8 @@ func newTestPool(t *testing.T, blockSize int) (
 	return pool, idx, tp
 }
 
-// newTestPoolWithStorage creates a Pool with both GPU and storage indices.
+// newTestPoolWithStorage creates a Pool with both GPU and storage indices,
+// plus a GPU token cache for storage event correlation.
 func newTestPoolWithStorage(t *testing.T, blockSize int, storageIndex kvblock.Index, accumulator *CheckpointAccumulator) (
 	*Pool, kvblock.Index, kvblock.TokenProcessor,
 ) {
@@ -43,6 +82,10 @@ func newTestPoolWithStorage(t *testing.T, blockSize int, storageIndex kvblock.In
 	pool, idx, tp := newTestPool(t, blockSize)
 	pool.storageIndex = storageIndex
 	pool.storageAccumulator = accumulator
+
+	gpuTokenCache, err := lru.New[kvblock.BlockHash, *gpuBatchData](1000)
+	require.NoError(t, err)
+	pool.gpuTokenCache = gpuTokenCache
 
 	return pool, idx, tp
 }
@@ -576,33 +619,36 @@ func TestProcessEventBatch_StorageBlockStored_DoesNotWriteToGPUIndex(t *testing.
 
 	// 256 tokens = 16 canonical blocks at blockSize=16
 	tokens := makeTokens(256)
-	engineKey := uint64(99999)
+	gpuEngineKeys := makeEngineKeys(16, 80000)
+	storageEngineKey := uint64(99999)
 
-	batch := &EventBatch{
+	// First: process a GPU event to cache token data (keyed by first engine key)
+	gpuBatch := &EventBatch{
 		Events: []GenericEvent{
 			&BlockStoredEvent{
-				BlockHashes: []uint64{engineKey},
+				BlockHashes: gpuEngineKeys,
 				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, gpuBatch, "pod-1", "test-model")
+
+	// Now: send storage event referencing the same first engine key (no tokens)
+	storageBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: append(gpuEngineKeys[:1], storageEngineKey),
 				ParentHash:  0,
 				DeviceTier:  "shared_storage",
 			},
 		},
 	}
+	pool.processEventBatch(ctx, storageBatch, "pod-1", "test-model")
 
-	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
-
-	// Derive the canonical request keys
-	gpuKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
-	require.NoError(t, err)
-	require.NotEmpty(t, gpuKeys)
-
-	// Verify NONE of the keys were added to the GPU/CPU index
-	podsPerKey, err := idx.Lookup(ctx, gpuKeys, nil)
-	require.NoError(t, err)
-	assert.Empty(t, podsPerKey, "storage event should not write keys to GPU/CPU index")
-
-	// Verify the engine key is NOT in the GPU/CPU index
-	_, err = idx.GetRequestKey(ctx, kvblock.BlockHash(engineKey))
+	// Verify the storage-only engine key is NOT in the GPU/CPU index
+	_, err = idx.GetRequestKey(ctx, kvblock.BlockHash(storageEngineKey))
 	assert.Error(t, err, "engine key from storage event should not be in GPU/CPU index")
 }
 
@@ -622,18 +668,30 @@ func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
 	tokens := makeTokens(32)
 	engineKeys := []uint64{11111, 22222}
 
-	batch := &EventBatch{
+	// First: process GPU event to cache token data (keyed by engineKeys[0]=11111)
+	gpuBatch := &EventBatch{
 		Events: []GenericEvent{
 			&BlockStoredEvent{
 				BlockHashes: engineKeys,
 				Tokens:      tokens,
 				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, gpuBatch, "pod-1", "test-model")
+
+	// Now: send storage event with same engine keys (no tokens)
+	storageBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				ParentHash:  0,
 				DeviceTier:  "shared_storage",
 			},
 		},
 	}
-
-	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+	pool.processEventBatch(ctx, storageBatch, "pod-1", "test-model")
 
 	// Derive the same canonical keys the Pool computed internally
 	canonicalKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -649,7 +707,7 @@ func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
 	assert.Contains(t, podsPerKey, checkpointKey)
 
 	// Remove path: evict using the engine key that was stored at checkpoint offset
-	batch = &EventBatch{
+	removeBatch := &EventBatch{
 		Events: []GenericEvent{
 			&BlockRemovedEvent{
 				BlockHashes: []uint64{22222},
@@ -657,7 +715,7 @@ func TestProcessEventBatch_StorageCheckpoint_WriteAndRemove(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+	pool.processEventBatch(ctx, removeBatch, "pod-1", "test-model")
 
 	// Verify checkpoint was removed from the storage index
 	podsPerKey, err = pool.storageIndex.Lookup(ctx, []kvblock.BlockHash{checkpointKey}, nil)

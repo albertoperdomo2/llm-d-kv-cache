@@ -64,22 +64,20 @@ func NewDefaultConfig() (*Config, error) {
 
 // StorageConfig holds configuration for the storage checkpoint scoring path.
 type StorageConfig struct {
-	Enabled               bool    `json:"enabled"`
-	StorageBlockSize      int     `json:"storageBlockSize"`
-	CheckpointStride      int     `json:"checkpointStride"`
-	StorageWeight         float64 `json:"storageWeight"`
-	MinPrefixBlocks       int     `json:"minPrefixBlocks"`
-	FilterCapacity        uint    `json:"filterCapacity"`
-	EngineKeyMapSize      int     `json:"engineKeyMapSize"`
-	AccumulatorCapacity   int     `json:"accumulatorCapacity"`
-	GPUTokenCacheCapacity int     `json:"gpuTokenCacheCapacity"`
+	Enabled              bool    `json:"enabled"`
+	CheckpointStride     int     `json:"checkpointStride"`
+	StorageWeight        float64 `json:"storageWeight"`
+	MinPrefixBlocks      int     `json:"minPrefixBlocks"`
+	FilterCapacity       uint    `json:"filterCapacity"`
+	EngineKeyMapSize     int     `json:"engineKeyMapSize"`
+	AccumulatorCapacity  int     `json:"accumulatorCapacity"`
+	GPUTokenCacheCapacity int    `json:"gpuTokenCacheCapacity"`
 }
 
 // DefaultStorageConfig returns a default storage configuration.
 func DefaultStorageConfig() *StorageConfig {
 	return &StorageConfig{
 		Enabled:               false,
-		StorageBlockSize:      256,
 		CheckpointStride:      64,
 		StorageWeight:         0.3,
 		MinPrefixBlocks:       1,
@@ -90,12 +88,9 @@ func DefaultStorageConfig() *StorageConfig {
 	}
 }
 
-func validateStorageConfig(cfg *StorageConfig, gpuBlockSize int) error {
+func validateStorageConfig(cfg *StorageConfig) error {
 	if cfg == nil || !cfg.Enabled {
 		return nil
-	}
-	if cfg.StorageBlockSize <= 0 {
-		return fmt.Errorf("storageBlockSize must be greater than 0")
 	}
 	if cfg.CheckpointStride <= 0 {
 		return fmt.Errorf("checkpointStride must be greater than 0")
@@ -103,20 +98,14 @@ func validateStorageConfig(cfg *StorageConfig, gpuBlockSize int) error {
 	if cfg.AccumulatorCapacity <= 0 {
 		return fmt.Errorf("accumulatorCapacity must be greater than 0")
 	}
-	if cfg.GPUTokenCacheCapacity <= 0 {
-		return fmt.Errorf("gpuTokenCacheCapacity must be greater than 0")
-	}
 	if cfg.FilterCapacity == 0 {
 		return fmt.Errorf("filterCapacity must be greater than 0")
 	}
 	if cfg.EngineKeyMapSize <= 0 {
 		return fmt.Errorf("engineKeyMapSize must be greater than 0")
 	}
-	if gpuBlockSize <= 0 {
-		return fmt.Errorf("gpu block size must be greater than 0")
-	}
-	if cfg.StorageBlockSize%gpuBlockSize != 0 {
-		return fmt.Errorf("storageBlockSize must be a multiple of gpu block size")
+	if cfg.GPUTokenCacheCapacity <= 0 {
+		return fmt.Errorf("gpuTokenCacheCapacity must be greater than 0")
 	}
 	return nil
 }
@@ -144,11 +133,7 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 		return nil, fmt.Errorf("tokenProcessor cannot be nil")
 	}
 
-	blockSize := kvblock.DefaultTokenProcessorConfig().BlockSize
-	if config.TokenProcessorConfig != nil && config.TokenProcessorConfig.BlockSize > 0 {
-		blockSize = config.TokenProcessorConfig.BlockSize
-	}
-	if err := validateStorageConfig(config.StorageConfig, blockSize); err != nil {
+	if err := validateStorageConfig(config.StorageConfig); err != nil {
 		return nil, fmt.Errorf("invalid storage config: %w", err)
 	}
 

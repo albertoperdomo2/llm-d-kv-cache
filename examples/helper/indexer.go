@@ -34,7 +34,6 @@ const (
 	EnvTokenizerEndpoint = "TOKENIZER_ENDPOINT" //nolint:gosec // env var name, not a credential
 
 	envStorageIndexEnabled    = "STORAGE_INDEX_ENABLED"
-	envStorageBlockSize       = "STORAGE_BLOCK_SIZE"
 	envCheckpointStride       = "STORAGE_CHECKPOINT_STRIDE"
 	envStorageWeight          = "STORAGE_WEIGHT"
 	envStorageMinPrefixBlocks = "STORAGE_MIN_PREFIX_BLOCKS"
@@ -83,9 +82,6 @@ func applyStorageExampleConfig(config *kvcache.Config) {
 
 	if enabled, err := strconv.ParseBool(os.Getenv(envStorageIndexEnabled)); err == nil {
 		storageCfg.Enabled = enabled
-	}
-	if blockSize, err := strconv.Atoi(os.Getenv(envStorageBlockSize)); err == nil && blockSize > 0 {
-		storageCfg.StorageBlockSize = blockSize
 	}
 	if stride, err := strconv.Atoi(os.Getenv(envCheckpointStride)); err == nil && stride > 0 {
 		storageCfg.CheckpointStride = stride

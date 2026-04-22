@@ -138,7 +138,6 @@ func SetupEventsPool(ctx context.Context, indexer *kvcache.Indexer) (*kvevents.P
 	if storageCfg != nil && storageCfg.Enabled {
 		opt, err := kvevents.WithStorageConfig(
 			indexer.StorageIndex(),
-			storageCfg.StorageBlockSize,
 			storageCfg.CheckpointStride,
 			storageCfg.AccumulatorCapacity,
 			storageCfg.GPUTokenCacheCapacity,

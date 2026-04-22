@@ -57,7 +57,6 @@ const (
 	defaultHTTPPort = "8080"
 
 	envStorageIndexEnabled = "STORAGE_INDEX_ENABLED"
-	envStorageBlockSize    = "STORAGE_BLOCK_SIZE"
 	envCheckpointStride    = "STORAGE_CHECKPOINT_STRIDE"
 	envStorageWeight       = "STORAGE_WEIGHT"
 	envStorageMinPrefix    = "STORAGE_MIN_PREFIX_BLOCKS"
@@ -169,9 +168,6 @@ func applyStorageExampleConfig(config *kvcache.Config) {
 	if enabled, err := strconv.ParseBool(os.Getenv(envStorageIndexEnabled)); err == nil {
 		storageCfg.Enabled = enabled
 	}
-	if blockSize, err := strconv.Atoi(os.Getenv(envStorageBlockSize)); err == nil && blockSize > 0 {
-		storageCfg.StorageBlockSize = blockSize
-	}
 	if stride, err := strconv.Atoi(os.Getenv(envCheckpointStride)); err == nil && stride > 0 {
 		storageCfg.CheckpointStride = stride
 	}
@@ -275,7 +271,6 @@ func setupEventsPool(ctx context.Context, indexer *kvcache.Indexer) (*kvevents.P
 	if storageCfg != nil && storageCfg.Enabled {
 		opt, err := kvevents.WithStorageConfig(
 			indexer.StorageIndex(),
-			storageCfg.StorageBlockSize,
 			storageCfg.CheckpointStride,
 			storageCfg.AccumulatorCapacity,
 			storageCfg.GPUTokenCacheCapacity,

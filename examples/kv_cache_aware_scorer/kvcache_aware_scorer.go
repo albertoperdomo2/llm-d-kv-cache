@@ -131,7 +131,6 @@ func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePr
 	if storageCfg != nil && storageCfg.Enabled {
 		opt, err := kvevents.WithStorageConfig(
 			kvCacheIndexer.StorageIndex(),
-			storageCfg.StorageBlockSize,
 			storageCfg.CheckpointStride,
 			storageCfg.AccumulatorCapacity,
 			storageCfg.GPUTokenCacheCapacity,
