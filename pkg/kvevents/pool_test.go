@@ -757,6 +757,214 @@ func TestCheckpointAccumulator_ReturnsCheckpointOffsets(t *testing.T) {
 	})
 }
 
+func TestProcessEventBatch_StorageCheckpoint_InsertsAllCrossedCheckpoints(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	// stride=4: checkpoint every 4 canonical blocks
+	accumulator, err := NewCheckpointAccumulator(4, 1000)
+	require.NoError(t, err)
+
+	pool, _, _ := newTestPoolWithStorage(t, 16, storageIndex, accumulator)
+
+	// 128 tokens = 8 canonical blocks at blockSize=16
+	// With stride=4: checkpoints at offsets 3 and 7
+	tokens := makeTokens(128)
+	engineKeys := makeEngineKeys(8, 50000)
+
+	// First: process GPU event to cache token data
+	gpuBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, gpuBatch, "pod-1", "test-model")
+
+	// Now: send storage event with same engine keys (no tokens)
+	storageBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, storageBatch, "pod-1", "test-model")
+
+	canonicalKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, canonicalKeys, 8)
+
+	// Checkpoints at canonical positions 3 and 7
+	checkpoint1 := canonicalKeys[3]
+	checkpoint2 := canonicalKeys[7]
+
+	podsPerKey, err := pool.storageIndex.Lookup(ctx, []kvblock.BlockHash{checkpoint1, checkpoint2}, nil)
+	require.NoError(t, err)
+	assert.Contains(t, podsPerKey, checkpoint1, "first checkpoint should be in storage index")
+	assert.Contains(t, podsPerKey, checkpoint2, "second checkpoint should be in storage index")
+
+	// Non-checkpoint positions should NOT be in the storage index
+	nonCheckpoint := canonicalKeys[0]
+	podsPerKey, err = pool.storageIndex.Lookup(ctx, []kvblock.BlockHash{nonCheckpoint}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, podsPerKey, "non-checkpoint key should not be in storage index")
+}
+
+func TestProcessEventBatch_StorageAddError_DoesNotBlockGPUEvents(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	// Create an erroring storage index that fails on Add
+	baseStorageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+	storageIndex := &erroringIndex{
+		Index:  baseStorageIndex,
+		addErr: errFake,
+	}
+
+	// stride=2: checkpoint after every 2 canonical blocks
+	accumulator, err := NewCheckpointAccumulator(2, 1000)
+	require.NoError(t, err)
+
+	pool, idx, _ := newTestPoolWithStorage(t, 16, storageIndex, accumulator)
+
+	storageTokens := makeTokens(32) // 2 blocks, crosses stride=2
+	storageEngineKeys := makeEngineKeys(2, 70000)
+	gpuTokens := makeTokens(16) // 1 block
+	gpuEngineKey := uint64(71000)
+
+	// First: process a GPU event to cache token data for the storage engine keys
+	gpuCacheBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: storageEngineKeys,
+				Tokens:      storageTokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, gpuCacheBatch, "pod-1", "test-model")
+
+	// Now: batch with storage event (will fail on Add) followed by GPU event (should succeed)
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: storageEngineKeys,
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+			&BlockStoredEvent{
+				BlockHashes: []uint64{gpuEngineKey},
+				Tokens:      gpuTokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Storage Add was attempted (and failed)
+	assert.Equal(t, 1, storageIndex.addCalls)
+
+	// GPU event should still have been processed successfully
+	resolvedKey, err := idx.GetRequestKey(ctx, kvblock.BlockHash(gpuEngineKey))
+	require.NoError(t, err)
+	expectedKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, gpuTokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, expectedKeys, 1)
+	assert.Equal(t, expectedKeys[0], resolvedKey)
+}
+
+func TestProcessEventBatch_StorageEvictError_DoesNotBlockGPUEvents(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	baseStorageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+	storageIndex := &erroringIndex{
+		Index:    baseStorageIndex,
+		evictErr: errFake,
+	}
+
+	accumulator, err := NewCheckpointAccumulator(2, 1000)
+	require.NoError(t, err)
+
+	pool, idx, _ := newTestPoolWithStorage(t, 16, storageIndex, accumulator)
+
+	gpuTokens := makeTokens(16)
+	gpuEngineKey := uint64(72000)
+
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockRemovedEvent{
+				BlockHashes: []uint64{73000},
+				DeviceTier:  "shared_storage",
+			},
+			&BlockStoredEvent{
+				BlockHashes: []uint64{gpuEngineKey},
+				Tokens:      gpuTokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Evict was attempted (and failed)
+	assert.Equal(t, 1, storageIndex.evictCalls)
+
+	// GPU event should still have been processed successfully
+	resolvedKey, err := idx.GetRequestKey(ctx, kvblock.BlockHash(gpuEngineKey))
+	require.NoError(t, err)
+	expectedKeys, err := pool.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, gpuTokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, expectedKeys, 1)
+	assert.Equal(t, expectedKeys[0], resolvedKey)
+}
+
+func TestProcessEventBatch_StorageNoCachedData_SkipsGracefully(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	accumulator, err := NewCheckpointAccumulator(2, 1000)
+	require.NoError(t, err)
+
+	pool, _, _ := newTestPoolWithStorage(t, 16, storageIndex, accumulator)
+
+	// Send a storage event without any prior GPU event — no cached data exists
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: makeEngineKeys(2, 90000),
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+
+	// Should not panic or error — just skip gracefully
+	pool.processEventBatch(ctx, batch, "pod-1", "test-model")
+
+	// Nothing should be in the storage index
+	fakeKeys := []kvblock.BlockHash{kvblock.BlockHash(90000), kvblock.BlockHash(90001)}
+	podsPerKey, err := storageIndex.Lookup(ctx, fakeKeys, nil)
+	require.NoError(t, err)
+	assert.Empty(t, podsPerKey, "no checkpoints should be written when GPU cache miss")
+}
+
 func TestCheckpointAccumulator_TracksCountsAcrossEvents(t *testing.T) {
 	acc, err := NewCheckpointAccumulator(4, 1000) // stride=4
 	require.NoError(t, err)
@@ -804,4 +1012,268 @@ func TestCheckpointAccumulator_TracksCountsAcrossEvents(t *testing.T) {
 	storedCount, ok := acc.counts.Get(lastKey4)
 	require.True(t, ok)
 	assert.Equal(t, 4, storedCount)
+}
+
+// --- Integration test: Pool write path → scoring contract ---
+
+// TestIntegration_PoolWriteToScoringContract verifies the full write lifecycle
+// and the contract with the Indexer's scoring path:
+//
+//	GPU event → token cache → storage event → checkpoint accumulation
+//	→ storage index contains the right canonical keys at checkpoint positions
+//	→ manual scoring calculation matches expected bonus
+//
+// Uses a real TokenProcessor (no mocks) to ensure canonical key alignment.
+func TestIntegration_PoolWriteToScoringContract(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	const (
+		blockSize = 16
+		stride    = 2
+		weight    = 0.3
+	)
+
+	// Shared indices — write path populates, scoring path reads.
+	gpuIndex, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	// Real token processor — ensures canonical keys are consistent.
+	tp, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{
+		BlockSize: blockSize,
+		HashSeed:  "integration-test",
+	})
+	require.NoError(t, err)
+
+	// Pool setup
+	accumulator, err := NewCheckpointAccumulator(stride, 1000)
+	require.NoError(t, err)
+
+	gpuTokenCache, err := lru.New[kvblock.BlockHash, *gpuBatchData](1000)
+	require.NoError(t, err)
+
+	pool := NewPool(DefaultConfig(), gpuIndex, tp, nil)
+	pool.storageIndex = storageIndex
+	pool.storageAccumulator = accumulator
+	pool.gpuTokenCache = gpuTokenCache
+
+	// 128 tokens at blockSize=16 → 8 canonical blocks
+	// stride=2 → checkpoints at offsets 1, 3, 5, 7
+	tokens := makeTokens(128)
+	engineKeys := makeEngineKeys(8, 60000)
+
+	// 1) GPU event: indexes blocks in GPU index, caches tokens for storage correlation
+	gpuBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, gpuBatch, "pod-a", "test-model")
+
+	// Verify GPU index has all 8 blocks for pod-a
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, canonicalKeys, 8)
+
+	podsPerKey, err := gpuIndex.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+	assert.Len(t, podsPerKey, 8, "all 8 canonical blocks should be in GPU index")
+
+	// Verify GPU token cache was populated
+	cachedData, ok := pool.gpuTokenCache.Get(kvblock.BlockHash(engineKeys[0]))
+	require.True(t, ok, "GPU token cache should have data for first engine key")
+	assert.Equal(t, tokens, cachedData.tokens)
+	assert.Equal(t, "test-model", cachedData.modelName)
+
+	// 2) Storage event: same engine keys, no tokens (resolved from GPU cache)
+	storageBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, storageBatch, "pod-a", "test-model")
+
+	// 3) Verify storage index has checkpoints at the right canonical positions.
+	// stride=2 → checkpoints at canonical indices 1, 3, 5, 7
+	checkpointIndices := []int{1, 3, 5, 7}
+	checkpointKeys := make([]kvblock.BlockHash, len(checkpointIndices))
+	for i, idx := range checkpointIndices {
+		checkpointKeys[i] = canonicalKeys[idx]
+	}
+
+	storageLookup, err := storageIndex.Lookup(ctx, checkpointKeys, nil)
+	require.NoError(t, err)
+	for _, cpKey := range checkpointKeys {
+		assert.Contains(t, storageLookup, cpKey,
+			"checkpoint key should be in storage index")
+	}
+
+	// Non-checkpoint positions should NOT be in the storage index
+	nonCheckpointKeys := []kvblock.BlockHash{canonicalKeys[0], canonicalKeys[2], canonicalKeys[4], canonicalKeys[6]}
+	nonCPLookup, err := storageIndex.Lookup(ctx, nonCheckpointKeys, nil)
+	require.NoError(t, err)
+	assert.Empty(t, nonCPLookup, "non-checkpoint keys should not be in storage index")
+
+	// 4) Manually replicate the Indexer's scoring logic to verify the bonus.
+	// This mirrors pkg/kvcache/indexer.go:362-406 (the storage scoring block).
+	//
+	// Walk checkpoints sequentially, stop at first miss:
+	highestCheckpoint := -1
+	for i, key := range checkpointKeys {
+		if _, found := storageLookup[key]; found {
+			highestCheckpoint = i
+		} else {
+			break
+		}
+	}
+	assert.Equal(t, 3, highestCheckpoint, "all 4 checkpoints should be found sequentially")
+
+	storagePrefixBlocks := (highestCheckpoint + 1) * stride
+	assert.Equal(t, 8, storagePrefixBlocks, "storage covers all 8 canonical blocks")
+
+	// pod-a has GPU score = 8 (all blocks matched)
+	// storagePrefixBlocks (8) is NOT greater than gpuPrefixLen (8) → no bonus
+	gpuPrefixLenPodA := 8
+	assert.False(t, storagePrefixBlocks > gpuPrefixLenPodA,
+		"no bonus when storage doesn't extend beyond GPU coverage")
+
+	// pod-b has only 2 blocks in GPU → bonus should apply
+	podBEntries := []kvblock.PodEntry{{PodIdentifier: "pod-b", DeviceTier: "gpu"}}
+	err = gpuIndex.Add(ctx,
+		[]kvblock.BlockHash{kvblock.BlockHash(engineKeys[0]), kvblock.BlockHash(engineKeys[1])},
+		canonicalKeys[:2],
+		podBEntries)
+	require.NoError(t, err)
+
+	gpuPrefixLenPodB := 2
+	assert.True(t, storagePrefixBlocks > gpuPrefixLenPodB,
+		"storage extends beyond pod-b's GPU coverage")
+
+	expectedBonus := float64(storagePrefixBlocks-gpuPrefixLenPodB) * weight
+	assert.InDelta(t, 1.8, expectedBonus, 0.0001,
+		"bonus = (8-2)*0.3 = 1.8")
+
+	expectedTotal := float64(gpuPrefixLenPodB) + expectedBonus
+	assert.InDelta(t, 3.8, expectedTotal, 0.0001,
+		"pod-b total: GPU(2.0) + storage(1.8) = 3.8")
+}
+
+// TestIntegration_StorageEviction_RemovesCheckpoints verifies the full
+// eviction lifecycle: checkpoints are removed from the storage index when
+// a BlockRemovedEvent arrives, and subsequent scoring sees no storage bonus.
+func TestIntegration_StorageEviction_RemovesCheckpoints(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+
+	const (
+		blockSize = 16
+		stride    = 2
+	)
+
+	gpuIndex, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+
+	storageIndex, err := kvblock.NewCuckooStorageIndex(nil)
+	require.NoError(t, err)
+
+	tp, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{
+		BlockSize: blockSize,
+		HashSeed:  "eviction-test",
+	})
+	require.NoError(t, err)
+
+	accumulator, err := NewCheckpointAccumulator(stride, 1000)
+	require.NoError(t, err)
+
+	gpuTokenCache, err := lru.New[kvblock.BlockHash, *gpuBatchData](1000)
+	require.NoError(t, err)
+
+	pool := NewPool(DefaultConfig(), gpuIndex, tp, nil)
+	pool.storageIndex = storageIndex
+	pool.storageAccumulator = accumulator
+	pool.gpuTokenCache = gpuTokenCache
+
+	// 64 tokens → 4 canonical blocks, stride=2 → checkpoints at offsets 1, 3
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 40000)
+
+	// GPU event → cache tokens
+	gpuBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				Tokens:      tokens,
+				ParentHash:  0,
+				DeviceTier:  "gpu",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, gpuBatch, "pod-a", "test-model")
+
+	// Storage event → write checkpoints
+	storageBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: engineKeys,
+				ParentHash:  0,
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, storageBatch, "pod-a", "test-model")
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, canonicalKeys, 4)
+
+	// Verify checkpoints exist before eviction
+	checkpoint1 := canonicalKeys[1] // offset 1
+	checkpoint2 := canonicalKeys[3] // offset 3
+	lookup, err := storageIndex.Lookup(ctx, []kvblock.BlockHash{checkpoint1, checkpoint2}, nil)
+	require.NoError(t, err)
+	assert.Len(t, lookup, 2, "both checkpoints should exist before eviction")
+
+	// Evict the engine key at offset 1 (the first checkpoint)
+	evictBatch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockRemovedEvent{
+				BlockHashes: []uint64{engineKeys[1]},
+				DeviceTier:  "shared_storage",
+			},
+		},
+	}
+	pool.processEventBatch(ctx, evictBatch, "pod-a", "test-model")
+
+	// After eviction, checkpoint1 should be gone, checkpoint2 still present
+	lookup, err = storageIndex.Lookup(ctx, []kvblock.BlockHash{checkpoint1, checkpoint2}, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, lookup, checkpoint1, "evicted checkpoint should be removed")
+	assert.Contains(t, lookup, checkpoint2, "non-evicted checkpoint should still exist")
+
+	// Scoring walk stops at first miss → highestCheckpoint = -1
+	// (checkpoint at index 0 = canonicalKeys[1] is missing)
+	checkpointKeys := []kvblock.BlockHash{checkpoint1, checkpoint2}
+	storageLookup, err := storageIndex.Lookup(ctx, checkpointKeys, nil)
+	require.NoError(t, err)
+
+	highestCheckpoint := -1
+	for i, key := range checkpointKeys {
+		if _, found := storageLookup[key]; found {
+			highestCheckpoint = i
+		} else {
+			break
+		}
+	}
+	assert.Equal(t, -1, highestCheckpoint,
+		"walk stops at first miss → no storage bonus after evicting the first checkpoint")
 }
