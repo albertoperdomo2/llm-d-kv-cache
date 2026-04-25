@@ -56,10 +56,11 @@ const (
 	envHTTPPort     = "HTTP_PORT"
 	defaultHTTPPort = "8080"
 
-	envStorageIndexEnabled = "STORAGE_INDEX_ENABLED"
-	envCheckpointStride    = "STORAGE_CHECKPOINT_STRIDE"
-	envStorageWeight       = "STORAGE_WEIGHT"
-	envStorageMinPrefix    = "STORAGE_MIN_PREFIX_BLOCKS"
+	envStorageIndexEnabled   = "STORAGE_INDEX_ENABLED"
+	envCheckpointStride     = "STORAGE_CHECKPOINT_STRIDE"
+	envStorageWeight        = "STORAGE_WEIGHT"
+	envStorageMinPrefix     = "STORAGE_MIN_PREFIX_BLOCKS"
+	envGPUTokenCacheCapacity = "STORAGE_GPU_CACHE_CAPACITY"
 )
 
 // ChatCompletionsRequest holds the fields needed for chat-completions rendering.
@@ -176,6 +177,9 @@ func applyStorageExampleConfig(config *kvcache.Config) {
 	}
 	if weight, err := strconv.ParseFloat(os.Getenv(envStorageWeight), 64); err == nil && weight >= 0 {
 		storageCfg.StorageWeight = weight
+	}
+	if capacity, err := strconv.Atoi(os.Getenv(envGPUTokenCacheCapacity)); err == nil && capacity > 0 {
+		storageCfg.GPUTokenCacheCapacity = capacity
 	}
 }
 

@@ -33,10 +33,11 @@ const (
 	// or host:port (e.g. localhost:50051) for TCP mode.
 	EnvTokenizerEndpoint = "TOKENIZER_ENDPOINT" //nolint:gosec // env var name, not a credential
 
-	envStorageIndexEnabled    = "STORAGE_INDEX_ENABLED"
+	envStorageIndexEnabled     = "STORAGE_INDEX_ENABLED"
 	envCheckpointStride       = "STORAGE_CHECKPOINT_STRIDE"
 	envStorageWeight          = "STORAGE_WEIGHT"
 	envStorageMinPrefixBlocks = "STORAGE_MIN_PREFIX_BLOCKS"
+	envGPUTokenCacheCapacity  = "STORAGE_GPU_CACHE_CAPACITY"
 )
 
 func isTCPAddr(s string) bool {
@@ -91,6 +92,9 @@ func applyStorageExampleConfig(config *kvcache.Config) {
 	}
 	if weight, err := strconv.ParseFloat(os.Getenv(envStorageWeight), 64); err == nil && weight >= 0 {
 		storageCfg.StorageWeight = weight
+	}
+	if capacity, err := strconv.Atoi(os.Getenv(envGPUTokenCacheCapacity)); err == nil && capacity > 0 {
+		storageCfg.GPUTokenCacheCapacity = capacity
 	}
 }
 
