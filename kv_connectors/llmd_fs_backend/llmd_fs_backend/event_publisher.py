@@ -54,7 +54,7 @@ class StorageEventPublisher:
     def __init__(
         self,
         endpoint: str,
-        block_size: int = 0,
+        block_size: int,
         model_name: str | None = None,
         sndhwm: int = DEFAULT_STORAGE_EVENTS_HWM,
         medium: StorageMedium = StorageMedium.SHARED_STORAGE,
@@ -63,9 +63,10 @@ class StorageEventPublisher:
 
         Args:
             endpoint: ZMQ bind address (e.g. ``tcp://*:5559``).
+            block_size: Number of tokens represented by each storage checkpoint.
             model_name: Model identifier included in the topic string.
-            medium: Storage backend type embedded in the topic and each event.
             sndhwm: ZMQ send high-water mark.
+            medium: Storage backend type embedded in the topic and each event.
         """
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.PUB)
