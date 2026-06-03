@@ -54,6 +54,7 @@ class StorageEventPublisher:
     def __init__(
         self,
         endpoint: str,
+        block_size: int = 0,
         model_name: str | None = None,
         sndhwm: int = DEFAULT_STORAGE_EVENTS_HWM,
         medium: StorageMedium = StorageMedium.SHARED_STORAGE,
@@ -74,6 +75,7 @@ class StorageEventPublisher:
 
         self._model_name = model_name
         self._medium = medium
+        self._block_size = block_size
         self._topic = (
             f"kv@{self._medium.value}@{self._model_name}" if self._model_name else None
         )
@@ -102,7 +104,7 @@ class StorageEventPublisher:
             hashes,  # [1] block_hashes (all hashes from this complete_store call)
             0,  # [2] parent_hash (unknown at storage tier)
             [],  # [3] token_ids (empty)
-            0,  # [4] block_size (unused)
+            self._block_size,  # [4] block_size
             None,  # [5] lora_id
             self._medium.value,  # [6] medium / device tier
         ]
