@@ -16,6 +16,8 @@ limitations under the License.
 
 package kvcache
 
+import "github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
+
 type KVCacheBackendConfig struct {
 	// Name is the identifier for this medium (e.g., "gpu", "cpu", "disk")
 	Name string `json:"name"`
@@ -27,5 +29,6 @@ func DefaultKVCacheBackendConfig() []*KVCacheBackendConfig {
 	return []*KVCacheBackendConfig{
 		{Name: "gpu", Weight: 1.0},
 		{Name: "cpu", Weight: 0.8},
+		{Name: kvblock.SharedStorageBackendName, Weight: 0.3},
 	}
 }
