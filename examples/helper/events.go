@@ -110,7 +110,11 @@ func SimulateRemoveEvent(ctx context.Context, publisher *Publisher) error {
 	return nil
 }
 
-func SetupEventsPool(ctx context.Context, kvBlockIndex kvblock.Index) (*kvevents.Pool, error) {
+func SetupEventsPool(
+	ctx context.Context,
+	kvBlockIndex kvblock.Index,
+	storageIndex kvblock.StorageIndex,
+) (*kvevents.Pool, error) {
 	logger := log.FromContext(ctx)
 
 	cfg := kvevents.DefaultConfig()
@@ -128,6 +132,7 @@ func SetupEventsPool(ctx context.Context, kvBlockIndex kvblock.Index) (*kvevents
 	}
 
 	pool := kvevents.NewPool(cfg, kvBlockIndex, tokenProcessor, adapter)
+	pool.SetStorageIndex(storageIndex)
 
 	return pool, nil
 }
