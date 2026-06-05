@@ -305,7 +305,7 @@ func TestScoreTokens(t *testing.T) {
 	}
 }
 
-func TestScoreTokens_ExtendsLocalPrefixWithStorageCheckpoints(t *testing.T) {
+func TestScoreTokens_DoesNotScoreSharedStorageCheckpoints(t *testing.T) {
 	indexer := newStorageTestIndexer(t, []uint64{10, 20, 30, 40, 50, 60, 70, 80})
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 
@@ -321,7 +321,7 @@ func TestScoreTokens_ExtendsLocalPrefixWithStorageCheckpoints(t *testing.T) {
 	scores, err := indexer.ScoreTokens(ctx, []uint32{1}, testModel, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, scores, 1)
-	assert.InDelta(t, 3.8, scores[testPodA], 0.0001)
+	assert.InDelta(t, 2.0, scores[testPodA], 0.0001)
 }
 
 func TestScoreTokens_DoesNotExposeStorageOnlyHits(t *testing.T) {
@@ -336,25 +336,7 @@ func TestScoreTokens_DoesNotExposeStorageOnlyHits(t *testing.T) {
 	assert.Empty(t, scores)
 }
 
-func TestScoreTokens_StorageScoringStopsAtMissingCheckpoint(t *testing.T) {
-	indexer := newStorageTestIndexer(t, []uint64{10, 20, 30, 40, 50, 60, 70, 80})
-	ctx := logging.NewTestLoggerIntoContext(context.Background())
-
-	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
-		10: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
-		20: {{PodIdentifier: testPodA, DeviceTier: "gpu"}},
-	})
-
-	indexer.StorageIndex().SetStride(4)
-	require.True(t, indexer.StorageIndex().AddCheckpoint(80))
-
-	scores, err := indexer.ScoreTokens(ctx, []uint32{1}, testModel, nil, nil)
-	require.NoError(t, err)
-	require.Len(t, scores, 1)
-	assert.InDelta(t, 2.0, scores[testPodA], 0.0001)
-}
-
-func TestScoreTokens_StorageScoringHonorsPodIdentifierFilter(t *testing.T) {
+func TestScoreTokens_StorageIndexDoesNotBypassPodIdentifierFilter(t *testing.T) {
 	indexer := newStorageTestIndexer(t, []uint64{10, 20, 30, 40})
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 
@@ -375,7 +357,7 @@ func TestScoreTokens_StorageScoringHonorsPodIdentifierFilter(t *testing.T) {
 	scores, err := indexer.ScoreTokens(ctx, []uint32{1}, testModel, []string{testPodA}, nil)
 	require.NoError(t, err)
 	require.Len(t, scores, 1)
-	assert.InDelta(t, 2.6, scores[testPodA], 0.0001)
+	assert.InDelta(t, 2.0, scores[testPodA], 0.0001)
 	assert.NotContains(t, scores, testPodB)
 }
 

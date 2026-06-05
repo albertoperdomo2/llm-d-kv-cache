@@ -42,7 +42,7 @@ type Config struct {
 	BackendConfigs      []*KVCacheBackendConfig `json:"kvCacheBackendConfigs"`
 
 	// StorageIndexConfig configures the shared-storage checkpoint index.
-	// Nil or Enabled=false disables storage scoring entirely.
+	// Nil or Enabled=false disables storage indexing entirely.
 	StorageIndexConfig *kvblock.StorageIndexConfig `json:"storageIndexConfig,omitempty"`
 
 	// TokenizersPoolConfig configures the in-process tokenization pool.
@@ -315,90 +315,7 @@ func (k *Indexer) ScoreTokens(
 		return nil, fmt.Errorf("failed to query kvblock scorer: %w", err)
 	}
 
-	if k.storageIndex != nil {
-		stride := k.storageIndex.Stride()
-		var storageWeight float64
-		for _, bc := range k.config.BackendConfigs {
-			if bc.Name == kvblock.SharedStorageBackendName || bc.Name == kvblock.ObjectStoreBackendName {
-				storageWeight = bc.Weight
-				break
-			}
-		}
-		if stride > 0 && storageWeight > 0 && len(blockKeys) >= stride {
-			if podScores == nil {
-				podScores = make(map[string]float64)
-			}
-			k.extendWithStorageScores(blockKeys, keyToPods, podScores, stride, storageWeight)
-		}
-	}
-
 	return podScores, nil
-}
-
-func (k *Indexer) extendWithStorageScores(
-	blockKeys []kvblock.BlockHash,
-	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
-	podScores map[string]float64,
-	stride int,
-	storageWeight float64,
-) {
-	// Storage-only hits are intentionally invisible for now. Storage is global
-	// availability, not pod-local locality, so only pods with an existing
-	// local GPU/CPU prefix are extended by storage checkpoints.
-	localPrefixLengths := computeLocalPrefixLengths(blockKeys, keyToPods)
-
-	for podID, localLen := range localPrefixLengths {
-		firstCheckpoint := ((localLen/stride)+1)*stride - 1
-		if firstCheckpoint >= len(blockKeys) {
-			continue
-		}
-
-		for pos := firstCheckpoint; pos < len(blockKeys); pos += stride {
-			if !k.storageIndex.HasCheckpoint(blockKeys[pos]) {
-				break
-			}
-			segmentStart := pos - stride + 1
-			if segmentStart < localLen {
-				segmentStart = localLen
-			}
-			storageBlocks := pos + 1 - segmentStart
-			podScores[podID] += float64(storageBlocks) * storageWeight
-		}
-	}
-}
-
-func computeLocalPrefixLengths(
-	keys []kvblock.BlockHash,
-	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
-) map[string]int {
-	lengths := make(map[string]int)
-	active := make(map[string]struct{})
-
-	for i, key := range keys {
-		pods := keyToPods[key]
-		if len(pods) == 0 {
-			break
-		}
-		if i == 0 {
-			for _, p := range pods {
-				active[p.PodIdentifier] = struct{}{}
-				lengths[p.PodIdentifier] = 1
-			}
-		} else {
-			podSet := make(map[string]struct{})
-			for _, p := range pods {
-				podSet[p.PodIdentifier] = struct{}{}
-			}
-			for pod := range active {
-				if _, exists := podSet[pod]; exists {
-					lengths[pod] = i + 1
-				} else {
-					delete(active, pod)
-				}
-			}
-		}
-	}
-	return lengths
 }
 
 // podsPerKeyPrintHelper formats a map of keys to pod entries for printing.
