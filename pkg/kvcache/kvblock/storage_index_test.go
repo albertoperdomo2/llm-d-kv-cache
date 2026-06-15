@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package kvblock
+package kvblock_test
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 )
 
 func TestCuckooStorageIndexCheckpointLifecycle(t *testing.T) {
-	index := NewCuckooStorageIndex(1_000)
+	index := kvblock.NewCuckooStorageIndex(1_000)
 
 	require.True(t, index.AddCheckpoint(123))
 	assert.True(t, index.HasCheckpoint(123))
@@ -39,7 +41,7 @@ func TestCuckooStorageIndexCheckpointLifecycle(t *testing.T) {
 }
 
 func TestCuckooStorageIndexStrideAndDefaultCapacity(t *testing.T) {
-	index := NewCuckooStorageIndex(0)
+	index := kvblock.NewCuckooStorageIndex(0)
 
 	assert.Equal(t, 0, index.Stride())
 	index.SetStride(8)
